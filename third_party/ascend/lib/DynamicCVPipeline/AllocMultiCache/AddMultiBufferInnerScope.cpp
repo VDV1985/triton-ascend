@@ -292,6 +292,312 @@ namespace AddMultiBufferInnerScope {
 } // namespace triton
 } // namespace mlir
 
+static Value getIterCount(OpBuilder &builder, mlir::scf::ForOp forOp, Location loc,
+                          SmallVector<Operation *, 16> *newOps) {
+    auto i32Type = builder.getI32Type();
+    Value iv = forOp.getInductionVar();
+    Value lb = forOp.getLowerBound();
+    Value step = forOp.getStep();
+    Type ivType = iv.getType();
+
+    bool lbIsZero = false;
+    if (Operation *lbDefOp = lb.getDefiningOp()) {
+        if (auto constOp = dyn_cast<mlir::arith::ConstantOp>(lbDefOp)) {
+            if (auto intAttr = dyn_cast<mlir::IntegerAttr>(constOp.getValue()))
+                lbIsZero = (intAttr.getInt() == 0);
+        }
+    }
+
+    Value iterIdx;
+    if (lbIsZero) {
+        bool stepIsOne = false;
+        if (auto constOp = step.getDefiningOp<mlir::arith::ConstantOp>()) {
+            if (auto intVal = dyn_cast<mlir::IntegerAttr>(constOp.getValue()))
+                stepIsOne = (intVal.getInt() == 1);
+        }
+
+        if (stepIsOne) {
+            iterIdx = iv;
+        } else {
+            iterIdx = builder.create<mlir::arith::DivUIOp>(loc, iv, step);
+            if (newOps) newOps->push_back(iterIdx.getDefiningOp());
+        }
+    } else {
+        Value diff = builder.create<mlir::arith::SubIOp>(loc, iv, lb);
+        iterIdx = builder.create<mlir::arith::DivUIOp>(loc, diff, step);
+        if (newOps) {
+            newOps->push_back(diff.getDefiningOp());
+            newOps->push_back(iterIdx.getDefiningOp());
+        }
+    }
+
+    if (ivType == i32Type)
+        return iterIdx;
+
+    if (ivType.isIndex()) {
+        Value result = builder.create<mlir::arith::IndexCastOp>(loc, i32Type, iterIdx);
+        if (newOps) newOps->push_back(result.getDefiningOp());
+        return result;
+    }
+
+    if (auto intType = dyn_cast<mlir::IntegerType>(ivType)) {
+        if (intType.getWidth() < 32) {
+            Value result = builder.create<mlir::arith::ExtSIOp>(loc, i32Type, iterIdx);
+            if (newOps) newOps->push_back(result.getDefiningOp());
+            return result;
+        }
+        if (intType.getWidth() > 32) {
+            Value result = builder.create<mlir::arith::TruncIOp>(loc, i32Type, iterIdx);
+            if (newOps) newOps->push_back(result.getDefiningOp());
+            return result;
+        }
+    }
+
+    Value result = builder.create<mlir::arith::IndexCastOp>(loc, i32Type, iterIdx);
+    if (newOps) newOps->push_back(result.getDefiningOp());
+    return result;
+}
+
+// 创建单个 producer 操作
+static Operation *createProducerOp(OpBuilder &builder, Location loc, Value src, Value dst) {
+    return builder.create<mlir::bufferization::MaterializeInDestinationOp>(
+        loc, mlir::Type{}, src, dst,
+        mlir::UnitAttr::get(builder.getContext()),
+        mlir::UnitAttr::get(builder.getContext()));
+}
+
+// 构建 producer 的 if 链
+static void buildProducerIfChain(OpBuilder &builder, Location loc, Value bufIdx,
+                                Value depVal, SmallVector<BufferPair, kInlineBufferSize> &buffers,
+                                SmallVector<Operation *, 16> &newOps) {
+    int N = buffers.size();
+    Value zero = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 32);
+    Value firstCond = builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq, bufIdx, zero);
+    auto firstIf = builder.create<mlir::scf::IfOp>(loc, mlir::TypeRange{}, firstCond, true, true);
+
+    newOps.push_back(zero.getDefiningOp());
+    newOps.push_back(firstCond.getDefiningOp());
+    newOps.push_back(firstIf);
+
+    builder.setInsertionPointToStart(&firstIf.getThenRegion().front());
+    newOps.push_back(createProducerOp(builder, loc, depVal, buffers[0].second));
+    builder.create<mlir::scf::YieldOp>(loc);
+
+    mlir::Block *currentElseBlock = &firstIf.getElseRegion().front();
+    for (int i = 1; i < N - 1; ++i) {
+        builder.setInsertionPointToStart(currentElseBlock);
+        Value iVal = builder.create<mlir::arith::ConstantIntOp>(loc, i, 32);
+        Value cond = builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq, bufIdx, iVal);
+        auto nestedIf = builder.create<mlir::scf::IfOp>(loc, mlir::TypeRange{}, cond, true, true);
+
+        newOps.push_back(iVal.getDefiningOp());
+        newOps.push_back(cond.getDefiningOp());
+        newOps.push_back(nestedIf);
+
+        builder.setInsertionPointToStart(&nestedIf.getThenRegion().front());
+        newOps.push_back(createProducerOp(builder, loc, depVal, buffers[i].second));
+        builder.create<mlir::scf::YieldOp>(loc);
+
+        currentElseBlock = &nestedIf.getElseRegion().front();
+    }
+
+    builder.setInsertionPointToStart(currentElseBlock);
+    newOps.push_back(createProducerOp(builder, loc, depVal, buffers[N - 1].second));
+    builder.create<mlir::scf::YieldOp>(loc);
+
+    builder.setInsertionPointAfter(firstIf);
+}
+
+static SmallVector<Operation *, 16> insertProducerLogic(OpBuilder &builder, Value depVal,
+                                                       SmallVector<BufferPair, kInlineBufferSize> &buffers,
+                                                       mlir::scf::ForOp forOp) {
+    SmallVector<Operation *, 16> newOps;
+    int N = buffers.size();
+    Location loc = depVal.getLoc();
+
+    Value iterCount = getIterCount(builder, forOp, loc, &newOps);
+
+    if (N == 1) {
+        newOps.push_back(createProducerOp(builder, loc, depVal, buffers[0].second));
+        return newOps;
+    }
+
+    Value Nval = builder.create<mlir::arith::ConstantIntOp>(loc, N, 32);
+    Value bufIdx = builder.create<mlir::arith::RemSIOp>(loc, iterCount, Nval);
+    newOps.push_back(Nval.getDefiningOp());
+    newOps.push_back(bufIdx.getDefiningOp());
+
+    buildProducerIfChain(builder, loc, bufIdx, depVal, buffers, newOps);
+
+    return newOps;
+}
+
+// N==1 时 consumer 的处理（直接返回 buffer）
+static Operation *handleSingleBufferConsumer(OpBuilder &builder, Location loc,
+                                             SmallVector<BufferPair, kInlineBufferSize> &buffers) {
+    auto memrefType = mlir::cast<mlir::MemRefType>(buffers[0].second.getType());
+    auto tensorType = mlir::RankedTensorType::get(memrefType.getShape(), memrefType.getElementType());
+    return builder.create<mlir::bufferization::ToTensorOp>(
+        loc, tensorType, buffers[0].second,
+        mlir::UnitAttr::get(builder.getContext()),
+        mlir::UnitAttr::get(builder.getContext()));
+}
+
+// 构建 consumer 的 if 链（tensor 类型）
+static void buildConsumerTensorIfChain(OpBuilder &builder, Location loc, Value readIdx,
+                                      SmallVector<BufferPair, kInlineBufferSize> &buffers,
+                                      SmallVector<Operation *, 16> &newOps,
+                                      SmallVector<Operation *, 4> &outIfOps,
+                                      int groupId) {
+    int N = buffers.size();
+    auto memrefType = mlir::cast<mlir::MemRefType>(buffers[0].second.getType());
+    auto tensorType = mlir::RankedTensorType::get(memrefType.getShape(), memrefType.getElementType());
+    SmallVector<mlir::Type> resultTypes{tensorType};
+
+    Value zero = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 32);
+    Value firstCond = builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq, readIdx, zero);
+
+    auto firstIf = builder.create<mlir::scf::IfOp>(loc, resultTypes, firstCond, true, true);
+    if (groupId >= 0) {
+        firstIf->setAttr("ssbuffer.intraDeps", builder.getI32ArrayAttr({groupId, 0}));
+    }
+    newOps.push_back(zero.getDefiningOp());
+    newOps.push_back(firstCond.getDefiningOp());
+    newOps.push_back(firstIf);
+    outIfOps.push_back(firstIf);
+
+    builder.setInsertionPointToStart(&firstIf.getThenRegion().front());
+    auto ti0 = builder.create<mlir::bufferization::ToTensorOp>(
+        loc, tensorType, buffers[0].second,
+        mlir::UnitAttr::get(builder.getContext()),
+        mlir::UnitAttr::get(builder.getContext()));
+    newOps.push_back(ti0);
+    builder.create<mlir::scf::YieldOp>(loc, ti0.getResult());
+
+    mlir::Block *currentElseBlock = &firstIf.getElseRegion().front();
+    for (int i = 1; i < N - 1; ++i) {
+        builder.setInsertionPointToStart(currentElseBlock);
+        Value iVal = builder.create<mlir::arith::ConstantIntOp>(loc, i, 32);
+        Value cond = builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq, readIdx, iVal);
+        auto nestedIf = builder.create<mlir::scf::IfOp>(loc, resultTypes, cond, true, true);
+
+        newOps.push_back(iVal.getDefiningOp());
+        newOps.push_back(cond.getDefiningOp());
+        newOps.push_back(nestedIf);
+        outIfOps.push_back(nestedIf);
+
+        builder.setInsertionPointToStart(&nestedIf.getThenRegion().front());
+        auto ti = builder.create<mlir::bufferization::ToTensorOp>(
+            loc, tensorType, buffers[i].second,
+            mlir::UnitAttr::get(builder.getContext()),
+            mlir::UnitAttr::get(builder.getContext()));
+        newOps.push_back(ti);
+        builder.create<mlir::scf::YieldOp>(loc, ti.getResult());
+
+        currentElseBlock = &nestedIf.getElseRegion().front();
+    }
+
+    builder.setInsertionPointToStart(currentElseBlock);
+    auto tiLast = builder.create<mlir::bufferization::ToTensorOp>(
+        loc, tensorType, buffers[N - 1].second,
+        mlir::UnitAttr::get(builder.getContext()),
+        mlir::UnitAttr::get(builder.getContext()));
+    newOps.push_back(tiLast);
+    builder.create<mlir::scf::YieldOp>(loc, tiLast.getResult());
+
+    builder.setInsertionPointAfter(firstIf);
+}
+
+static SmallVector<Operation *, 16> insertConsumerLogic(OpBuilder &builder,
+                                                       Value depVal,
+                                                       SmallVector<BufferPair, kInlineBufferSize> &buffers,
+                                                       mlir::scf::ForOp forOp,
+                                                       SmallVector<Operation *, 4> &outIfOps,
+                                                       int groupId = -1) {
+    SmallVector<Operation *, 16> newOps;
+    int N = buffers.size();
+    Location loc = builder.getInsertionPoint()->getLoc();
+
+    Value iterCount = getIterCount(builder, forOp, loc, &newOps);
+
+    Value Nval = builder.create<mlir::arith::ConstantIntOp>(loc, N, 32);
+    Value readIdx = builder.create<mlir::arith::RemSIOp>(loc, iterCount, Nval);
+    newOps.push_back(Nval.getDefiningOp());
+    newOps.push_back(readIdx.getDefiningOp());
+
+    if (N == 1) {
+        outIfOps.push_back(handleSingleBufferConsumer(builder, loc, buffers));
+        return newOps;
+    }
+
+    buildConsumerTensorIfChain(builder, loc, readIdx, buffers, newOps, outIfOps, groupId);
+
+    return newOps;
+}
+
+static void addBlockAttrForOps(SmallVector<Operation *, 16> &newOps, int blockId,
+                              OpBuilder &builder) {
+    auto attr = builder.getI32IntegerAttr(blockId);
+    for (auto *op : newOps)
+        op->setAttr("ssbuffer.block_id", attr);
+}
+
+// 添加 dep_mark 属性到操作
+static void addDepMarkAttr(Operation *op, int depMark, OpBuilder &builder) {
+    if (auto existingAttr = op->getAttrOfType<mlir::ArrayAttr>("ssbuffer.dep_mark")) {
+        SmallVector<int> marks;
+        for (auto attr : existingAttr)
+            marks.push_back(cast<mlir::IntegerAttr>(attr).getInt());
+        marks.push_back(depMark);
+        op->setAttr("ssbuffer.dep_mark", builder.getI32ArrayAttr(marks));
+    } else {
+        op->setAttr("ssbuffer.dep_mark", builder.getI32ArrayAttr({depMark}));
+    }
+}
+
+// 收集跨 block 的用户操作
+static SmallVector<Operation *, 8> collectCrossBlockUsers(
+    Value depVal, int producerId,
+    DenseMap<Value, SmallVector<Operation *, 8>> &depUserMap) {
+    SmallVector<Operation *, 8> crossBlockUsers;
+
+    auto userIt = depUserMap.find(depVal);
+    if (userIt == depUserMap.end()) return crossBlockUsers;
+
+    for (Operation *depUser : userIt->second) {
+        if (triton::AddMultiBufferInnerScope::getSsbufferId(depUser) != producerId &&
+            triton::AddMultiBufferInnerScope::isInsideMainLoopForOpTraverse(depUser))
+            crossBlockUsers.push_back(depUser);
+    }
+    return crossBlockUsers;
+}
+
+static void markScalarDeps(SmallVector<Value, 8> &scalarValueList,
+                           DenseMap<Value, SmallVector<Operation *, 8>> &depUserMap,
+                           OpBuilder &builder) {
+    static int nextDepMark = 1;
+
+    for (Value depVal : scalarValueList) {
+        Operation *depDefinedOp = depVal.getDefiningOp();
+        if (!depDefinedOp) continue;
+
+        if (!triton::AddMultiBufferInnerScope::isInsideMainLoopForOp(depDefinedOp)) continue;
+
+        int producerId = triton::AddMultiBufferInnerScope::getSsbufferId(depDefinedOp);
+        auto crossBlockUsers = collectCrossBlockUsers(depVal, producerId, depUserMap);
+
+        if (crossBlockUsers.empty()) continue;
+
+        int depMark = nextDepMark++;
+        addDepMarkAttr(depDefinedOp, depMark, builder);
+
+        for (Operation *depUser : crossBlockUsers) {
+            addDepMarkAttr(depUser, depMark, builder);
+        }
+    }
+}
+
+
 void mlir::triton::AddMultiBufferInnerScopePass::runOnOperation()
 {
     ModuleOp module = getOperation();
