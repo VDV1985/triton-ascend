@@ -23,13 +23,15 @@
 #ifndef TRITON_ADAPTER_OP_CLASSIFIER_H
 #define TRITON_ADAPTER_OP_CLASSIFIER_H
 
-#include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
+#include "bishengir/Dialect/Annotation/IR/Annotation.h"
+#include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -50,7 +52,16 @@ public:
     OpClassifierPass() = default;
 
     // Run the pass
-    void runOnOperation();
+    void runOnOperation() override;
+
+    // Return the pass argument name
+    static constexpr ::llvm::StringRef getArgumentName() { return "op-classifier"; }
+    ::llvm::StringRef getArgument() const override { return "op-classifier"; }
+    ::llvm::StringRef getDescription() const override
+    {
+        return "Classify operations as CUBE or VECTOR for dynamic CV pipeline";
+    }
+    ::llvm::StringRef getName() const override { return "OpClassifierPass"; }
 
 private:
     // Map from operation to its core type
@@ -86,11 +97,67 @@ private:
 
     // Get upstream operations based on both SSA and memory dependencies
     void getUpstreamOpsWithMemoryDeps(Operation *cur, llvm::SmallVectorImpl<Operation *> &upstreamOps);
+
+    // Step 3: Mark remaining operations as VECTOR
+    int markRemainingAsVector();
+
+    // Step 4: Propagate VECTOR core type upstream
+    int propagateVectorUpstream();
+
+    // Initialize the pass
+    void initializePass(ModuleOp module);
+
+    // Get the core type of an operation
+    OpCoreType getCoreType(Operation *op) const;
+
+    // Set the core type of an operation
+    void setCoreType(Operation *op, OpCoreType coreType);
+
+    // Helper: join core types into comma-separated string
+    std::string joinCoreTypes(const std::vector<OpCoreType> &coreTypes);
+
+    // Helper: check if propagation should stop at this operation for yield
+    bool shouldStopPropagationForYield(Operation *op, OpCoreType targetCoreType);
+
+    // Helper: propagate core_type upward for yield operand
+    void propagateCoreTypeUpwardForYield(Operation *startOp, OpCoreType targetCoreType);
+
+    // Step 5: Handle else region yield of scf.if by extracting core_type from then region yield
+    bool handleYieldFromElseRegion(std::vector<OpCoreType> &coreTypes, unsigned operandIndex,
+                                   Operation *thenYieldForElse, Value &operand);
+
+    // Step 6: Handle CUBE_AND_VECTOR operations
+    int handleCubeAndVector();
+
+    // Helper: split CUBE_AND_VECTOR operation into CUBE and VECTOR versions
+    void splitOperationForCubeAndVector(Operation *op, llvm::DenseSet<Operation *> &processedOps,
+                                        llvm::DenseMap<Operation *, Operation *> &opToVectorClone);
+
+    // Step 7: Process SCF yield results
+    int handleSCFYield();
+
+    // Helper: process a single yield operation
+    void processYieldOperation(Operation *op, Operation *thenYieldForElse);
+
+    // Helper: Mark fill operations as CUBE when their output buffer is CUBE
+    void markFillOpsAsCube();
+
+    // Step 7: Pre-legalize matmul (before initializePass)
+    int preLegalizeMatmul();
+
+    // Helper: bulk delete operations and clean up tracking structures
+    void bulkDeleteOps(llvm::SmallVectorImpl<Operation *> &opsToDelete);
+
+    // Step 8: Stamp core type info to IR
+    int stampToIR();
+
+    // Helper: describe operation for logging
+    std::string describeOp(Operation *op) const;
 };
 
 // Create the pass
 std::unique_ptr<OperationPass<ModuleOp>> createOpClassifierPass();
-
+void registerAddOpClassifierPasses();
 } // namespace triton
 } // namespace mlir
 
