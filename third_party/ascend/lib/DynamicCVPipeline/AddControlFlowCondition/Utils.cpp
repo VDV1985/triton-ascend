@@ -21,6 +21,7 @@
  */
 
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/Utils.h"
+#include <optional>
 
 using namespace mlir;
 using namespace llvm;
@@ -158,4 +159,31 @@ SmallVector<int> triton::getBlockIdsInOrder(scf::ForOp forOp)
     }
   }
   return idsInOrder;
+}
+
+// Helper to get block_id attribute from op
+std::optional<int64_t> triton::getOpBlockId(Operation *op) {
+  auto blockIdAttr = op->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
+  if (!blockIdAttr) {
+    return std::nullopt;
+  }
+  return blockIdAttr.getInt();
+}
+
+// Get the block_id of the immediate child of scf.for that contains op
+// For nested ops inside scf.if/scf.for, returns the block_id of the immediate child of scf.for
+std::optional<int64_t> triton::getForDirectChildBlockId(Operation *op) {
+  scf::ForOp forOp = op->getParentOfType<scf::ForOp>();
+  if (!forOp) {
+    return std::nullopt;
+  }
+
+  // Walk up from op until we reach a direct child of forOp
+  while (op->getParentOp() != forOp.getOperation()) {
+    op = op->getParentOp();
+    if (!op) {
+      return std::nullopt;
+    }
+  }
+  return getOpBlockId(op);
 }

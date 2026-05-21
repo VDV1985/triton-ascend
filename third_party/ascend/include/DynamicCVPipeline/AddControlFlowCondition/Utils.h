@@ -23,6 +23,7 @@
 #ifndef TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_UTILS_H
 #define TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_UTILS_H
 
+#include <optional>
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -47,6 +48,13 @@ LogicalResult topologicalSort(SmallVector<Operation *> &ops);
 
 // Get block_ids in order of appearance in for loop body
 SmallVector<int> getBlockIdsInOrder(scf::ForOp forOp);
+
+// Helper to get block_id attribute from op
+std::optional<int64_t> getOpBlockId(Operation *op);
+
+// Get the block_id of the immediate child of scf.for that contains op
+std::optional<int64_t> getForDirectChildBlockId(Operation *op);
+
 } // namespace triton
 } // namespace mlir
 #endif // TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_UTILS_H

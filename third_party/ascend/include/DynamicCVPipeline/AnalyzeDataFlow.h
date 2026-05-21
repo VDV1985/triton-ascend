@@ -75,9 +75,25 @@ public:
   }
 };
 
+// Pass for analyzing scope-level issues
+class AnalyzeScopePass : public PassWrapper<AnalyzeScopePass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AnalyzeScopePass)
+
+  AnalyzeScopePass() = default;
+
+  void runOnOperation() override;
+
+  llvm::StringRef getArgument() const override { return "analyze-scope"; }
+  llvm::StringRef getDescription() const override {
+    return "Analyze scope-level issues for control flow";
+  }
+};
+
 std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeArgsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeFlagPass();
 std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeDataFlowPass();
+std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeScopePass();
 
 void registerAnalyzeDataFlowPasses();
 
