@@ -826,6 +826,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             ]
 
         if opt.debug:
+            _compile_option_list += ["--mlir-print-ir-after-failure"]
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
         cmd_list = (
             [npu_compiler_path, ttadapter_path]
