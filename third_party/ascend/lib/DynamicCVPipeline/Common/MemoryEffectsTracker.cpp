@@ -213,6 +213,11 @@ SmallVector<MemoryEffects::EffectInstance> MemoryDependenceGraph::collectOuterEf
 {
     unknown = false;
 
+    if (auto markOp = dyn_cast<annotation::MarkOp>(op)) {
+        MemoryEffects::EffectInstance scopedWrite(MemoryEffects::Write::get());
+        return {remapEffectValue(scopedWrite, markOp.getSrc())};
+    }
+
     std::optional<SmallVector<MemoryEffects::EffectInstance>> raw = getEffectsRecursively(op);
     if (!raw) {
         unknown = true;
