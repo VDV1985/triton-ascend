@@ -917,7 +917,7 @@ class NPUOptions:
     extern_libs: dict = None
     bisheng_options: str = "-cce-link-aicore-ll-module " + get_libdevice()
 
-    multibuffer: not is_compile_on_910_95
+    multibuffer: bool = not is_compile_on_910_95
     storage_align: bool = None
     ops_reorder: bool = None
     code_motion: bool = None
