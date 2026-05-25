@@ -917,7 +917,7 @@ class NPUOptions:
     extern_libs: dict = None
     bisheng_options: str = "-cce-link-aicore-ll-module " + get_libdevice()
 
-    multibuffer: bool = False #not is_compile_on_910_95
+    multibuffer: not is_compile_on_910_95
     storage_align: bool = None
     ops_reorder: bool = None
     code_motion: bool = None
@@ -946,12 +946,12 @@ class NPUOptions:
     set_workspace_multibuffer: int = None
     tile_mix_vector_loop: int = None
     tile_mix_cube_loop: int = None
-    disable_auto_inject_block_sync: bool = True #None
-    enable_mixed_cv: bool = True #None
+    disable_auto_inject_block_sync: bool = None
+    enable_mixed_cv: bool = None
     enable_vf_fusion: bool = None
     # todo: this code will be removed in version 530.
     add_auto_scheduling: bool = False
-    enable_dynamic_cv_pipeline: bool = True #False
+    enable_dynamic_cv_pipeline: bool = False
     hfusion_enable_multiple_consumer_fusion: bool = False
     has_auto_blockify_blacklist_op: Optional[bool] = None
     intra_cache_num: int = None
