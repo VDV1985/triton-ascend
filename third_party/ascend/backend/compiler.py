@@ -951,7 +951,7 @@ class NPUOptions:
     enable_vf_fusion: bool = None
     # todo: this code will be removed in version 530.
     add_auto_scheduling: bool = False
-    enable_dynamic_cv_pipeline: bool = False
+    enable_dynamic_cv_pipeline: bool = True if is_compile_on_910_95 else False
     hfusion_enable_multiple_consumer_fusion: bool = False
     has_auto_blockify_blacklist_op: Optional[bool] = None
     intra_cache_num: int = None
@@ -1047,6 +1047,12 @@ def ttir_to_npubin(mod, metadata, opt):
                     _compile_option_list += [
                         f"--append-bisheng-options={bisheng_options}"
                     ]
+
+            # Enable SIMT auto-blockify when TRITON_ALL_BLOCKS_PARALLEL is set,
+            # mirroring the SIMD compile paths. driver.py's runtime block-count
+            # cap keys off the same env switch, so the two stay in sync.
+            if _is_auto_map_parallel_blocks_enabled():
+                _compile_option_list += ["--enable-auto-blockify-loop"]
 
         npu_compiler_path, env = _get_npucompiler_path()
         cmd_list = (
