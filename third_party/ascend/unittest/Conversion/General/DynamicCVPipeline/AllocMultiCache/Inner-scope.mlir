@@ -704,4 +704,54 @@ func.func @test_t22_tensor_empty_in_nested_if() {
     return
   }
 
+//===--------------------------------------------------------------------===//
+// T23: scf.if with Else Branch Directly Yielding depVal
+// Test: Real scenario from if_problem.mlir where:
+//       - block_id = 11: linalg.fill produces depVal
+//       - scf.if with block_id = 20 has then/else branches
+//       - then branch has compute using depVal
+//       - else branch directly yields depVal (no compute)
+// Note: This test verifies that basic functionality still works.
+//       The real scenario with func.call producing depVal is tested separately
+//       in if_problem.mlir which is verified manually.
+//===--------------------------------------------------------------------===//
+  // CHECK-LABEL: func.func @test_t23_scf_if_else_branch_yield
+  // CHECK-DAG: memref.alloc
+  // CHECK-DAG: memref.memory_space_cast {{.*}} {ssbuffer.intraDeps
+  // CHECK-DAG: scf.if {{.*}} -> (tensor<16x32xf16>) {
+  // CHECK-DAG: arith.addf {{.*}} {ssbuffer.block_id = 20 : i32}
+  // CHECK-DAG: scf.yield
+  // CHECK-DAG: } else {
+  // CHECK-DAG: scf.yield {{.*}} : tensor<16x32xf16>
+  // CHECK-DAG: } {ssbuffer.block_id = 20 : i32}
+  // CHECK-DAG: hivm.hir.copy {{.*}} {ssbuffer.block_id = 20 : i32}
+func.func @test_t23_scf_if_else_branch_yield() {
+    %c0_i32 = arith.constant 0 : i32
+    %c100_i32 = arith.constant 100 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %cst = arith.constant 1.0 : f32
+    %cst_f16 = arith.constant 1.0 : f16
+    %empty = tensor.empty() : tensor<16x32xf16>
+    scope.scope : () -> () {
+      // Producer: linalg.fill with block_id = 11
+      %prod = linalg.fill {ssbuffer.block_id = 11 : i32} ins(%cst_f16 : f16) outs(%empty : tensor<16x32xf16>) -> tensor<16x32xf16>
+      %loop_result = scf.for %i = %c0_i32 to %c100_i32 step %c1_i32 iter_args(%arg = %prod) -> (tensor<16x32xf16>) : i32 {
+        %cond = arith.cmpi eq, %i, %c0_i32 : i32
+        // scf.if with block_id = 20
+        // then branch: compute using %arg (depVal from block_id 11)
+        // else branch: directly yield %arg (depVal from block_id 11)
+        %if_result = scf.if %cond -> (tensor<16x32xf16>) {
+          %consumed = arith.addf %arg, %arg {ssbuffer.block_id = 20 : i32} : tensor<16x32xf16>
+          scf.yield %consumed : tensor<16x32xf16>
+        } else {
+          scf.yield %arg : tensor<16x32xf16>
+        } {ssbuffer.block_id = 20 : i32}
+        %new_prod = arith.addf %if_result, %if_result {ssbuffer.block_id = 11 : i32} : tensor<16x32xf16>
+        scf.yield %new_prod : tensor<16x32xf16>
+      } {ssbuffer.main_loop = 1 : i64}
+      scope.return
+    } {hivm.tcore_type = #hivm.tcore_type<VECTOR>}
+    return
+  }
+
 }

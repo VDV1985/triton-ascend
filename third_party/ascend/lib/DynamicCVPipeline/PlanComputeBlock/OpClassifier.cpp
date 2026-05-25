@@ -1449,6 +1449,9 @@ int OpClassifierPass::preLegalizeMatmul()
             use.set(addResult);
         }
 
+        // This tag is useful for later work
+        addOp->setAttr(CVPipeline::kAddFromMatmul, builder.getUnitAttr());
+
         // [Step 8] Mark new operations as CUBE_ONLY
         opCoreTypes[newMatmul.getOperation()] = OP_CUBE_ONLY;
         opCoreTypes[emptyOp.getOperation()] = OP_CUBE_ONLY;
