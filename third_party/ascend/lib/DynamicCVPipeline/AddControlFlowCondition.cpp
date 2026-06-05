@@ -83,17 +83,19 @@ void AddControlFlowConditionPass::runOnOperation()
   PassManager pm(&getContext(), module.getOperationName());
   ControlFlowConditionInfo info;
 
-  // Step0: Initialize crossCoreDependentMap and intraCoreDependentMap
+  // Step0: Clone ops in vector/cube to ensure that each block_id has its own
+  // ops without sharing
+  pm.addPass(createCloneOpsPass());
+
+  // Step1: Initialize crossCoreDependentMap and intraCoreDependentMap
   std::unique_ptr<InitDependentMapPass> initDependentMapPass(new InitDependentMapPass());
   initDependentMapPass->setConditionInfo(&info);
   pm.addPass(std::move(initDependentMapPass));
-
-  // Step1: Clone ops in vector/cube to ensure that each block_id has its own
-  // ops without sharing
-  pm.addPass(createCloneOpsPass());
   
   // Step2: Process shared iter_args in for ops to eliminate arg sharing across block_ids
-  pm.addPass(createProcessArgsPass());
+  std::unique_ptr<ProcessArgsPass> processArgsPass(new ProcessArgsPass());
+  processArgsPass->setConditionInfo(&info);
+  pm.addPass(std::move(processArgsPass));
 
   // Step3: Create if ops based on block_id
   std::unique_ptr<CreateIfOpsPass> createIfOpsPass(new CreateIfOpsPass());
@@ -117,7 +119,7 @@ void AddControlFlowConditionPass::runOnOperation()
   pm.addPass(std::move(updateLoopIterTimesPass));
 
   if (failed(runPipeline(pm, module))) {
-    module->emitError() << "[" << DEBUG_TYPE << "] Pass failed!";
+    LDBG("Pass failed!");
     signalPassFailure();
   }
 

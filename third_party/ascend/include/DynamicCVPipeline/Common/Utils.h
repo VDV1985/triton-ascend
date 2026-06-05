@@ -38,7 +38,10 @@ inline constexpr llvm::StringLiteral kCubeFirst = "ssbuffer.cube_first";
 inline constexpr llvm::StringLiteral kVectorFirst = "ssbuffer.vector_first";
 inline constexpr llvm::StringLiteral kAddFromMatmul = "ssbuffer.add_from_matmul";
 inline constexpr llvm::StringLiteral kMainLoop = "ssbuffer.main_loop";
+inline constexpr llvm::StringLiteral kTcoreType = "hivm.tcore_type";
 inline constexpr llvm::StringLiteral kIf = "ssbuffer.if";
+inline constexpr llvm::StringLiteral kIntraBuffer = "ssbuffer.intra_buffer";
+inline constexpr llvm::StringLiteral kAnalyzeFlagId = "ssbuffer.analyze_flag_id";
 inline constexpr const char *ERRCODE_ATTR = "triton_ascend.dynamic_cv_pipeline.rc";
 static constexpr const int ERRCODE_FAILED = 1;
 static constexpr const int ERRCODE_IGNORED = 2;
@@ -73,6 +76,9 @@ inline bool isCubeOp(Operation *op)
 {
     return CVPipeline::getOpCoreType(op) == CoreType::CUBE_ONLY;
 }
+
+bool isVectorOnlyOp(Operation *op);
+
 } // namespace CVPipeline
 } // namespace mlir
 

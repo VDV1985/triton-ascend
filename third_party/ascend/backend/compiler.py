@@ -212,7 +212,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             compile_on_910_95
         )
         if metadata["enable_dynamic_cv_pipeline"]:
-            metadata["set_workspace_multibuffer"] = None
+            metadata["set_workspace_multibuffer"] = 0
             metadata["enable_mixed_cv"] = True
             metadata["disable_auto_inject_block_sync"] = True
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -975,6 +975,7 @@ class NPUOptions:
     simt_stack_limit: int = None
     # take effect on the reorder instruction pattern for SIMT. The pattern is disabled by default.
     enable_simt_reorder_instruction: bool = False
+    enable_costmodel_backend: bool = False
     # disable simt fma optimization to get high precision
     disable_fma: bool = False
 
@@ -1090,6 +1091,10 @@ class AscendBackend(BaseBackend):
             }
             args.setdefault("arch", self.target.arch)
             options = NPUOptions(**args)
+            # Costmodel path should avoid extra BC<->MLIR conversion stages
+            # to keep compile-only autotune routing lightweight and stable.
+            if getattr(options, "enable_costmodel_backend", False):
+                object.__setattr__(options, "use_bytecode", False)
         else:
             raise NotImplementedError(
                 f"Backend '{self.target.backend}' is not supported. "

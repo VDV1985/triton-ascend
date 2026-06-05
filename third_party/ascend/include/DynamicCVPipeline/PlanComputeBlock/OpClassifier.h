@@ -116,8 +116,6 @@ private:
     // Step 4: Propagate VECTOR core type upstream
     int propagateVectorUpstream();
 
-    bool checkPureCubeOrVector();
-
     // Initialize the pass
     void initializePass(ModuleOp module);
 
@@ -155,12 +153,6 @@ private:
 
     // Helper: Mark fill operations as CUBE when their output buffer is CUBE
     void markFillOpsAsCube();
-
-    // Step 7: Pre-legalize matmul (before initializePass)
-    int preLegalizeMatmul();
-
-    // Helper: bulk delete operations and clean up tracking structures
-    void bulkDeleteOps(llvm::SmallVectorImpl<Operation *> &opsToDelete);
 
     // Step 8: Stamp core type info to IR
     int stampToIR();
