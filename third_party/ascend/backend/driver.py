@@ -348,18 +348,30 @@ def make_npu_launcher_stub(header_src, wrapper_src, debug=False):
         return cache_path
 
     kernel_launcher_type = "torch"
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        src_path = os.path.join(tmpdir, f"{name}.cxx")
-        with open(src_path, "w") as f:
-            f.write(wrapper_src)
-        so_path = _build_npu_ext(name, src_path, kernel_launcher=kernel_launcher_type)
-        if debug:
-            with open(so_path, "rb") as f:
-                dump_manager.put(f.read(), so_name, binary=True)
-        with open(so_path, "rb") as f:
-            so_cache_path = so_cache_manager.put(f.read(), so_name, binary=True)
-    return so_cache_path
+    import fcntl
+    cache_dir = os.getenv("TRITON_CACHE_DIR", os.path.join(os.path.expanduser("~/.triton"), "cache"))
+    lock_dir = os.path.join(cache_dir, "lock")
+    if not (os.path.exists(lock_dir)):
+        os.makedirs(lock_dir, exist_ok=True)
+    with open(os.path.join(lock_dir, f"{so_cache_key}.lock"), "w") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            cache_path = so_cache_manager.get_file(so_name)
+            if cache_path is not None:
+                return cache_path
+            with tempfile.TemporaryDirectory() as tmpdir:
+                src_path = os.path.join(tmpdir, f"{name}.cxx")
+                with open(src_path, "w") as f:
+                    f.write(wrapper_src)
+                so_path = _build_npu_ext(name, src_path, kernel_launcher=kernel_launcher_type)
+                if debug:
+                    with open(so_path, "rb") as f:
+                        dump_manager.put(f.read(), so_name, binary=True)
+                with open(so_path, "rb") as f:
+                    so_cache_path = so_cache_manager.put(f.read(), so_name, binary=True)
+            return so_cache_path
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 def extract_device_print_code_from_cann():

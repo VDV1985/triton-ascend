@@ -131,7 +131,7 @@ bool DataDependencyAnalysisPass::isControlFlowOp(mlir::Operation *op) {
          isa<scf::YieldOp, scf::ConditionOp>(op);
 }
 
-bool DataDependencyAnalysisPass::isCubeOrVectorOp(mlir::Operation *op) {
+bool DataDependencyAnalysisPass::isCubeAndVectorOp(mlir::Operation *op) {
   if (isa<tensor::EmptyOp, linalg::FillOp>(op)) {
     return true;
   }
@@ -212,7 +212,7 @@ bool DataDependencyAnalysisPass::isValidValueForDependency(mlir::Value value) {
   Operation *defOp = value.getDefiningOp();
   // Op that can be processed both by CUBE and VECTOR should not be data
   // dependency
-  if (defOp && isCubeOrVectorOp(defOp)) {
+  if (defOp && isCubeAndVectorOp(defOp)) {
     return false;
   }
 
@@ -644,7 +644,7 @@ void DataDependencyAnalysisPass::processIterArgDependencies() {
         auto realInitValue = resolveNestedIterArgInitValue(initValue);
         auto realInitDefOp = realInitValue.getDefiningOp();
         auto realInitDefReuslt = dyn_cast<mlir::OpResult>(realInitValue);
-        if (!realInitDefOp || isCubeOrVectorOp(realInitDefOp)) {
+        if (!realInitDefOp || isCubeAndVectorOp(realInitDefOp)) {
           continue;
         }
         if (getCoreTypeWithIndex(realInitDefOp,
@@ -663,7 +663,29 @@ void DataDependencyAnalysisPass::processIterArgDependencies() {
           initDefOp, initDefReuslt ? initDefReuslt.getResultNumber() : 0);
 
       LOG_DEBUG("[initDefOp]: " << *initDefOp << "\n");
-      if (initCoreType == yieldCoreType || isCubeOrVectorOp(initDefOp)) {
+      if (isCubeAndVectorOp(initDefOp)) {
+        if (yieldCoreType == CVPipeline::kCoreTypeVector) {
+          auto diffUsers = collectDiffCoreTypeUsers(iterArg, yieldCoreType);
+          if (!diffUsers.empty()) {
+            insertProducerAndRecordDeps(loopOp, iterArg, yieldCoreType,
+                                        diffUsers, info);
+          }
+        } else if (yieldCoreType == CVPipeline::kCoreTypeCube) {
+          auto vectorUsers =
+              collectDiffCoreTypeUsers(iterArg, CVPipeline::kCoreTypeCube);
+          auto cubeUsers =
+              collectDiffCoreTypeUsers(iterArg, CVPipeline::kCoreTypeVector);
+          if (!vectorUsers.empty()) {
+            insertConsumerAndRecordDeps(loopOp, yieldedValue, iterArgIndex,
+                                        CVPipeline::kCoreTypeVector, info);
+            if (!cubeUsers.empty()) {
+              insertProducerAndRecordDeps(loopOp, iterArg,
+                                          CVPipeline::kCoreTypeVector,
+                                          cubeUsers, info);
+            }
+          }
+        }
+      } else if (initCoreType == yieldCoreType) {
         auto diffUsers = collectDiffCoreTypeUsers(iterArg, yieldCoreType);
         if (!diffUsers.empty()) {
           insertProducerAndRecordDeps(loopOp, iterArg, yieldCoreType, diffUsers,
