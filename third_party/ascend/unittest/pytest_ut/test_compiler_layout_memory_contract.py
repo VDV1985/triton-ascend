@@ -17,8 +17,10 @@ The installed Triton package can point at another worktree, so importing
 being changed here.
 """
 
+import ast
 import importlib.util
 import itertools
+import json
 import sys
 import types
 import warnings
@@ -108,6 +110,11 @@ def compiler_module():
         return normalized
 
     utils_stub = types.ModuleType(utils_name)
+    utils_path = compiler_path.with_name("utils.py")
+    utils_tree = ast.parse(utils_path.read_text())
+    mode_helper = next(node for node in utils_tree.body
+                       if isinstance(node, ast.FunctionDef) and node.name == "_multibuffer_mode_to_tuple")
+    exec(compile(ast.Module(body=[mode_helper], type_ignores=[]), str(utils_path), "exec"), utils_stub.__dict__)
     for name in (
             "_check_bishengir_api_change",
             "_check_bishengir_able_save_ir",
@@ -119,6 +126,7 @@ def compiler_module():
             "_is_debug_line_info_disabled",
             "_is_auto_map_parallel_blocks_enabled",
             "force_disable_ffts",
+            "is_cann_version_at_least",
     ):
         setattr(utils_stub, name, return_false)
     for name in (
@@ -149,8 +157,12 @@ def compiler_module():
 
     cache_stub = types.ModuleType(cache_name)
     cache_stub._base32 = lambda value: str(value)
-    cache_stub.get_dump_manager = lambda *_args, **_kwargs: SimpleNamespace(cache_dir="", put=lambda *_args, **_kwargs:
-                                                                            None)
+    dump_dir = Path("/fake/dump")
+    cache_stub.get_dump_manager = lambda *_args, **_kwargs: SimpleNamespace(
+        cache_dir=str(dump_dir),
+        _make_path=lambda filename: str(dump_dir / filename),
+        put=lambda *_args, **_kwargs: None,
+    )
 
     # Initialize the installed Triton package before temporarily replacing its
     # cache module below.  Loading compiler.py starts from triton._C; doing it
@@ -206,7 +218,7 @@ def _parse_options(compiler, arch, opts=None):
     return backend.parse_options({} if opts is None else opts)
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 @pytest.mark.parametrize(
     ("arch", "requested_capacity", "expected_capacity"),
     (
@@ -232,7 +244,7 @@ def test_npu_options_normalizes_graph_ub_budget(compiler_module, arch, requested
     assert options.graph_optimize_ub_capacity_bytes == expected_capacity
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 @pytest.mark.parametrize(
     ("arch", "requested_capacity", "expected_capacity"),
     (
@@ -257,7 +269,7 @@ def test_parse_options_normalizes_graph_ub_budget(compiler_module, arch, request
     assert options.graph_optimize_ub_capacity_bytes == expected_capacity
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 def test_normalized_graph_ub_budget_contributes_to_npu_hash(compiler_module):
     auto = compiler_module.NPUOptions(arch="Ascend910B1")
     explicit_none = compiler_module.NPUOptions(arch="Ascend910B1", graph_optimize_ub_capacity_bytes=None)
@@ -274,7 +286,7 @@ def test_normalized_graph_ub_budget_contributes_to_npu_hash(compiler_module):
     assert auto.hash() != small.hash()
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 @pytest.mark.parametrize(
     ("requested_capacity", "error_type"),
     (
@@ -296,7 +308,6 @@ def _make_opt(
     is_pure_simt,
     superblock_factor=0,
     simt_optimization_mode=0,
-    simt_stack_limit=None,
     shared_mem_dynamic_size=None,
     disable_fma=False,
     compile_on_910_95=False,
@@ -306,7 +317,6 @@ def _make_opt(
         num_warps=4,
         warp_size=32,
         simt_optimization_mode=simt_optimization_mode,
-        simt_stack_limit=simt_stack_limit,
         shared_mem_dynamic_size=shared_mem_dynamic_size,
         disable_fma=disable_fma,
         superblock_factor=superblock_factor,
@@ -336,7 +346,6 @@ def _run_ttir_to_npubin(
     superblock_factor=0,
     common_options=(),
     simt_optimization_mode=0,
-    simt_stack_limit=None,
     resolved_simt_stack_limit=1152,
     shared_mem_dynamic_size=None,
     disable_fma=False,
@@ -384,10 +393,9 @@ def _run_ttir_to_npubin(
     )
 
     # Keep this argv matrix independent of the host torch_npu configuration
-    # while checking that Pure-SIMT passes the explicit option to the resolver.
-    def get_simt_stack_limit(user_stack_limit):
-        assert user_stack_limit == simt_stack_limit
-        return resolved_simt_stack_limit if user_stack_limit is None else user_stack_limit
+    # while checking that Pure-SIMT uses the backend-resolved stack limit.
+    def get_simt_stack_limit():
+        return resolved_simt_stack_limit
 
     monkeypatch.setattr(compiler, "get_simt_stack_limit", get_simt_stack_limit)
     monkeypatch.setattr(compiler.subprocess, "run", run_bisheng)
@@ -399,7 +407,6 @@ def _run_ttir_to_npubin(
             is_pure_simt=is_pure_simt,
             superblock_factor=superblock_factor,
             simt_optimization_mode=simt_optimization_mode,
-            simt_stack_limit=simt_stack_limit,
             shared_mem_dynamic_size=shared_mem_dynamic_size,
             disable_fma=disable_fma,
         ),
@@ -409,10 +416,18 @@ def _run_ttir_to_npubin(
     return events, commands[0]
 
 
+def test_simt_stack_limit_is_not_a_compile_option(compiler_module):
+    assert "simt_stack_limit" not in compiler_module.NPUOptions.__dataclass_fields__
+    assert "simt_stack_limit" not in _parse_options(compiler_module, "Ascend910_9581").__dict__
+    with pytest.raises(TypeError, match="simt_stack_limit"):
+        compiler_module.NPUOptions(arch="Ascend910_9581", simt_stack_limit=8192)
+
+
 def _run_linalg_to_npubin(compiler, monkeypatch, function_name, has_blacklist_op):
     commands = []
     parsed_metadata = defaultdict(
         lambda: None, {
+            "hash": "layout-memory-contract-test",
             "target": SimpleNamespace(arch="Ascend910B"),
             "program_grid_transforms": None,
             "program_grid_mapping_applied": False,
@@ -457,7 +472,7 @@ def _run_linalg_to_npubin(compiler, monkeypatch, function_name, has_blacklist_op
     return commands[0]
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 def test_export_coalesce_metadata_removes_attrs_and_marks_row(compiler_module, monkeypatch):
     removed = []
 
@@ -509,7 +524,7 @@ def test_export_coalesce_metadata_removes_attrs_and_marks_row(compiler_module, m
     }
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 def test_export_coalesce_metadata_rejects_partial_row_contract(compiler_module, monkeypatch):
 
     def get_int_attr(module, name):
@@ -545,7 +560,7 @@ def test_export_coalesce_metadata_rejects_partial_row_contract(compiler_module, 
         )
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 def test_ttir_to_npubin_exports_make_ttir_row_contract_only_for_pure_simt(compiler_module, monkeypatch):
     events, _command = _run_ttir_to_npubin(
         compiler_module,
@@ -629,14 +644,14 @@ def test_make_ttir_passes_canonical_compile_mode_to_graph_optimize(compiler_modu
     assert events[-1] == "run_row"
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 def test_npu_options_keep_graph_remark_compatibility_default(compiler_module):
     """The legacy graph-remarks name remains discoverable with a fixed default."""
     options = compiler_module.NPUOptions(arch="Ascend910B1")
     assert options.__dict__["graph_optimize_emit_remarks"] is False
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 @pytest.mark.parametrize(
     ("arch", "expected_capacity"),
     (
@@ -814,7 +829,7 @@ def test_non_pure_simt_linalg_compilers_keep_blacklist_auto_blockify_gate(
 
 
 def test_default_compile_mode_keeps_the_91095_layout_memory_gate_prepared(compiler_module):
-    """The canonical default is portable and enables the A5 template gate."""
+    """The canonical default is portable and enables the Ascend 950 template gate."""
 
     a2_default = compiler_module.NPUOptions(arch="Ascend910B1")
     assert a2_default.compile_on_910_95 is False
@@ -868,3 +883,170 @@ def test_default_compile_mode_keeps_the_91095_layout_memory_gate_prepared(compil
     # Legacy spellings remain discoverable while compile_mode controls lowering.
     assert explicit_only.__dict__["force_simt_only"] is False
     assert explicit_template.__dict__["force_simt_template"] is False
+
+
+@pytest.mark.parametrize("arch", ["Ascend910B4", "Ascend910_9391", "Ascend950PR"])
+@pytest.mark.parametrize("mode", [
+    {"gm": 4, "l1": 2, "l0c": 1, "ub": 2},
+    {"future": 0, "gm": -1},
+    {},
+])
+def test_multibuffer_mode_preserves_values_and_metadata(compiler_module, arch, mode):
+    options = _parse_options(compiler_module, arch, {"multibuffer_mode": mode})
+    expected = tuple(sorted(mode.items()))
+    assert options.multibuffer_mode == expected
+    assert options.num_stages is None
+    assert options.multibuffer is True
+    metadata = dict(options.__dict__, multibuffer_mode=json.loads(json.dumps(options.multibuffer_mode)))
+    restored = _parse_options(compiler_module, arch, metadata)
+    assert restored.multibuffer_mode == expected
+    assert restored.hash() == options.hash()
+    assert restored.hash() != _parse_options(compiler_module, arch).hash()
+
+
+@pytest.mark.parametrize("mode", [
+    "[(gm,2)]",
+    True,
+    2,
+    {"gm": "2"},
+    {1: 2},
+    {"gm": 2.0},
+    {"gm": True},
+    ("gm", 2),
+    (("gm", ), ),
+    (("gm", 2, 3), ),
+    ((1, 2), ),
+    (("gm", 2.0), ),
+    (("gm", True), ),
+])
+def test_multibuffer_mode_requires_string_keys_and_integer_counts(compiler_module, mode):
+    with pytest.raises(TypeError, match="multibuffer_mode must be a dict"):
+        compiler_module.NPUOptions(multibuffer_mode=mode)
+
+
+@pytest.mark.parametrize("name,value", [
+    ("limit_auto_multi_buffer_only_for_local_buffer", False),
+    ("limit_auto_multi_buffer_of_local_buffer", "no-l0c"),
+    ("limit_auto_multi_buffer_buffer", "only-vector"),
+])
+@pytest.mark.parametrize("mode", [None, {"ub": 2}])
+def test_multibuffer_legacy_options_are_preserved_without_ta_warnings(compiler_module, name, value, mode):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        options = compiler_module.NPUOptions(multibuffer_mode=mode, **{name: value})
+    assert not caught
+    assert getattr(options, name) == value
+    assert options.multibuffer is True
+
+
+def _capture_multibuffer_command(compiler, monkeypatch, is_a5, requested, derived=None):
+    options = _parse_options(compiler, "Ascend950PR" if is_a5 else "Ascend910B4", requested)
+    metadata = dict(options.__dict__, hash="layout-memory-contract-test", mix_mode="mix", bitcodes=None,
+                    auto_blockify_enabled=False)
+    metadata.update(derived or {})
+    monkeypatch.setattr(compiler, "_parse_linalg_metadata", lambda source, meta: (source, meta))
+    monkeypatch.setattr(compiler, "_finalize_program_launch_policy", lambda *_args: None)
+    monkeypatch.setattr(compiler, "get_common_bishengir_compile_options", lambda _meta: [])
+    monkeypatch.setattr(compiler, "get_auto_bind_sub_block_option", lambda _meta: True)
+    monkeypatch.setattr(compiler, "_get_npucompiler_path", lambda: ("/fake/compiler", {}))
+    monkeypatch.setattr(compiler, "NPUUtils",
+                        lambda: SimpleNamespace(has_device_limit=lambda: False, get_arch=lambda: options.target_arch))
+    monkeypatch.delenv("TRITON_ENABLE_LIBDEVICE", raising=False)
+
+    class CommandCaptured(BaseException):
+        pass
+
+    commands = []
+
+    def capture(command, **_kwargs):
+        commands.append(command)
+        raise CommandCaptured
+
+    monkeypatch.setattr(compiler.subprocess, "run", capture)
+    compile_fn = (compiler.linalg_to_bin_enable_npu_compile_910_95
+                  if is_a5 else compiler.linalg_to_bin_enable_npu_compile_A2_A3)
+    with pytest.raises(CommandCaptured):
+        compile_fn("module {}", metadata, options)
+    assert len(commands) == 1
+    return commands[0]
+
+
+@pytest.mark.parametrize("is_a5", [False, True])
+@pytest.mark.parametrize("requested,enabled", [({}, True), ({"num_stages": 1}, False), ({"num_stages": 3}, True),
+                                               ({"multibuffer": False}, False)])
+def test_multibuffer_legacy_command_stays_on_old_interface(compiler_module, monkeypatch, is_a5, requested, enabled):
+    command = _capture_multibuffer_command(compiler_module, monkeypatch, is_a5, requested)
+    assert not any(arg.startswith("--multibuffer-mode=") for arg in command)
+    assert f"--enable-auto-multi-buffer={enabled}" in command
+    assert ("--limit-auto-multi-buffer-of-local-buffer=no-limit" in command) == is_a5
+
+
+@pytest.mark.parametrize("is_a5", [False, True])
+def test_multibuffer_mode_is_forwarded_alongside_existing_defaults(compiler_module, monkeypatch, is_a5):
+    mode = {"ub": 2, "gm": 4, "l0c": 1, "l1": 2}
+    command = _capture_multibuffer_command(compiler_module, monkeypatch, is_a5, {"multibuffer_mode": mode})
+    assert command.count("--multibuffer-mode=[(gm,4),(l0c,1),(l1,2),(ub,2)]") == 1
+    assert "--enable-auto-multi-buffer=True" in command
+    assert ("--limit-auto-multi-buffer-of-local-buffer=no-limit" in command) == is_a5
+
+
+@pytest.mark.parametrize("is_a5", [False, True])
+@pytest.mark.parametrize("switch", [False, True])
+def test_multibuffer_explicit_old_options_are_still_forwarded(compiler_module, monkeypatch, is_a5, switch):
+    requested = {
+        "multibuffer_mode": {"gm": 4, "l1": 2, "l0c": 2, "ub": 2},
+        "multibuffer": switch,
+        "limit_auto_multi_buffer_only_for_local_buffer": True,
+        "limit_auto_multi_buffer_of_local_buffer": "no-l0c",
+        "limit_auto_multi_buffer_buffer": "only-vector",
+        "set_workspace_multibuffer": 0,
+    }
+    command = _capture_multibuffer_command(compiler_module, monkeypatch, is_a5, requested)
+    assert "--multibuffer-mode=[(gm,4),(l0c,2),(l1,2),(ub,2)]" in command
+    assert f"--enable-auto-multi-buffer={switch}" in command
+    assert "--limit-auto-multi-buffer-only-for-local-buffer=True" in command
+    assert "--limit-auto-multi-buffer-of-local-buffer=no-l0c" in command
+    assert "--set-workspace-multibuffer=0" in command
+    if is_a5:
+        assert "--limit-auto-multi-buffer-buffer=only-vector" in command
+
+
+def test_multibuffer_keeps_dynamic_cv_workspace_constraint(compiler_module, monkeypatch):
+    command = _capture_multibuffer_command(compiler_module, monkeypatch, True,
+                                           {"multibuffer_mode": {"gm": 4, "l1": 2, "l0c": 1, "ub": 2}},
+                                           derived={"set_workspace_multibuffer": 0})
+    assert "--set-workspace-multibuffer=0" in command
+
+
+@pytest.mark.parametrize("is_a5", [False, True])
+def test_multibuffer_value_semantics_are_left_to_npuir(compiler_module, monkeypatch, is_a5):
+    # Level names and count ranges are vendor decisions; partial modes are forwarded as supplied.
+    command = _capture_multibuffer_command(compiler_module, monkeypatch, is_a5,
+                                           {"multibuffer_mode": {"future": 0, "ub": -1}})
+    assert "--multibuffer-mode=[(future,0),(ub,-1)]" in command
+
+
+@pytest.mark.parametrize("arch", ["Ascend910B4", "Ascend910_9391", "Ascend950PR"])
+@pytest.mark.parametrize("stages", [0, 1, 2, 3])
+@pytest.mark.parametrize("mode", [{"gm": 2, "l1": 2, "l0c": 2, "ub": 2}, {}])
+def test_multibuffer_mode_rejects_num_stages_even_when_equivalent(compiler_module, arch, stages, mode):
+    with pytest.raises(ValueError, match="num_stages and multibuffer_mode cannot be specified together"):
+        _parse_options(compiler_module, arch, {"multibuffer_mode": mode, "num_stages": stages})
+
+
+def test_multibuffer_default_num_stages_does_not_conflict(compiler_module):
+    assert compiler_module.NPUOptions().num_stages == 2
+    assert compiler_module.NPUOptions(num_stages=1).num_stages == 1
+    options = compiler_module.NPUOptions(multibuffer_mode={"ub": 2}, num_stages=None)
+    assert options.num_stages is None
+
+
+@pytest.mark.parametrize("arch", ["Ascend910B4", "Ascend950PR"])
+def test_multibuffer_dictionary_order_does_not_change_compiler_hash(compiler_module, arch):
+    mode = {"ub": 2, "gm": 4, "l1": 2}
+    options = _parse_options(compiler_module, arch, {"multibuffer_mode": mode})
+    reordered = _parse_options(compiler_module, arch, {"multibuffer_mode": dict(reversed(list(mode.items())))})
+    assert reordered.multibuffer_mode == options.multibuffer_mode
+    assert reordered.hash() == options.hash()
+    mode["ub"] = 8
+    assert dict(options.multibuffer_mode)["ub"] == 2

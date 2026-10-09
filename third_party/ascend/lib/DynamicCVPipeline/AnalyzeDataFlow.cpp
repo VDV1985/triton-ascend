@@ -57,6 +57,8 @@ void AnalyzeDataFlowPass::runOnOperation() {
 
   pm.addPass(createAnalyzeWhileConditionArgsPass());
 
+  pm.addPass(createAnalyzeSplitIfPass());
+
   if (failed(runPipeline(pm, module))) {
     if (!CVPipeline::hasFallbackAttr(module)) {
       std::cout << "[VDV DEBUG] AnalyzeDataFlow failed - FALLBACK" << std::endl;
@@ -83,6 +85,7 @@ void registerAnalyzeDataFlowPasses() {
   registerPass(createAnalyzeDataFlowPass);
   registerPass(createAnalyzeWhileConditionArgsPass);
   registerPass(createAnalyzeCubeContolFLowInputChainPass);
+  registerPass(createAnalyzeSplitIfPass);
 }
 
 } // namespace triton

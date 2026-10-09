@@ -35,6 +35,24 @@ import pybind11
 
 _is_compile_on_910_95 = None
 
+
+def _multibuffer_mode_to_tuple(value):
+    """Freeze a mode dictionary, or restore its pairs from a JSON cache.
+
+    Sort keys for stable hashing regardless of dictionary insertion order.
+    NPU IR owns level names, count semantics and legacy-option handling.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = tuple(value.items())
+    if not isinstance(value, (list, tuple)) or any(not isinstance(pair, (list, tuple)) or len(pair) != 2
+                                                   or not isinstance(pair[0], str) or type(pair[1]) is not int
+                                                   for pair in value):
+        raise TypeError("multibuffer_mode must be a dict[str, int], cached (str, int) pairs, or None")
+    return tuple(sorted((level, count) for level, count in value))
+
+
 # Compatibility boundary for compile-option cleanup.  Public dictionaries
 # route renamed options and discard backend-managed options before community
 # JIT validates the remaining keys.
@@ -282,7 +300,7 @@ def _warn_deprecated_ascend_env_vars() -> None:
 
 
 def is_compile_on_910_95(arch: str = None) -> bool:
-    """Return whether the compilation target belongs to the A5 generation."""
+    """Return whether the compilation target belongs to the Ascend 950 generation."""
     if arch is not None:
         return isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950"))
 
@@ -883,6 +901,7 @@ def _find_cann_version_file():
     return None
 
 
+@functools.lru_cache(None)
 def get_cann_version():
     _cann_version = None
     try:
@@ -914,11 +933,6 @@ def cann_version_compile_args():
     if is_cann_version_at_least(9, 1, 0):
         return ["-DTRITON_CANN_910"]
     return []
-
-
-def triton_enable_libdevice_simt(arch: str = None) -> bool:
-    """Return whether the environment switch selects SIMT libdevice."""
-    return bool(os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)) and is_compile_on_910_95(arch)
 
 
 def get_cann_version_file_hash():
