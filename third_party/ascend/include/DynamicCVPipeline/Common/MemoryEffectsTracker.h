@@ -29,10 +29,6 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/SmallVector.h"
 
 #include <fstream>
 #include <string>
@@ -46,7 +42,7 @@
 
 namespace mlir {
 namespace CVPipeline {
-constexpr int INIT_SIZE = 4;
+constexpr int kInitSize = 4;
 
 class MemoryDependenceGraph {
 public:
@@ -68,7 +64,7 @@ private:
     Value memref;
     Operation *lastWriter = nullptr;
     Operation *dataSource = nullptr;
-    SmallPtrSet<Operation *, INIT_SIZE> pendingReads;
+    SmallPtrSet<Operation *, kInitSize> pendingReads;
     explicit MemSlot(Value v) : memref(v) {}
   };
 
@@ -78,9 +74,6 @@ private:
 
   void analyzeOp(Operation *op);
   void analyzeRegionsOf(Operation *op);
-
-  SmallVector<MemoryEffects::EffectInstance>
-  collectOuterEffects(Operation *op, bool &unknown, bool recursive = true);
 
   SmallVector<MemSlot *> findAliasSlots(Value v);
   ArrayRef<MemSlot *>
