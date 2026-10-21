@@ -67,11 +67,9 @@
 
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
 
-#include "DynamicCVPipeline/Common/Analysis.h"
 #include "DynamicCVPipeline/Common/MemoryEffectsTracker.h"
 #include "DynamicCVPipeline/Common/SyncWall.h"
 #include "DynamicCVPipeline/Common/Utils.h"
-#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 
 using namespace mlir;
