@@ -2425,6 +2425,11 @@ BlockDataParser::rewriteTerminator(
 bool isUsedWithCondition(Value v, std::function<bool(OpOperand *)> cond,
                          int depth = 0,
                          llvm::SmallSetVector<Value, 8> *visited = nullptr) {
+  // BlockDataParser consumes integer scalars without parsing their producers.
+  // Do not require upstream tensor carriers to be decomposed through them.
+  if (isa<IntegerType>(v.getType()))
+    return false;
+
   llvm::SmallSetVector<Value, 8> localVisited;
   if (!visited) {
     visited = &localVisited;

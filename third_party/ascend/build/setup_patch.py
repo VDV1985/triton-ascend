@@ -167,7 +167,9 @@ def get_triton_ascend_patch_file():
         "python/triton/language/math.py",
         "python/triton/language/semantic.py",
         "python/triton/language/standard.py",
+        "python/triton/runtime/autotuner.py",
         "python/triton/runtime/interpreter.py",
+        "python/triton/runtime/autotuner.py",
         "python/triton/runtime/jit.py",
         "bin/RegisterTritonDialects.h",
         "bin/triton-opt.cpp",
@@ -364,7 +366,7 @@ def _ensure_distributed_submodule():
     if os.getenv("TRITON_BUILD_TD", "OFF").upper() not in ["ON", "1", "YES", "TRUE", "Y"]:
         return
     distributed_dir = _REPO_ROOT / "third_party" / "ascend" / "Triton-distributed-ascend"
-    commit_id = "8c1dae1acbb4bcf99c3e473c8ed876f2cd42ba35"
+    commit_id = "22f740b1138a43e789c470dc07bbd7abbbedc256"
     if not distributed_dir.is_dir():
         try:
             _git_check_call_with_retry([
@@ -634,6 +636,8 @@ def patch_module(mod):
 
     def get_packages():
         yield from _orig_get_packages()
+        yield "triton.backends.ascend.reuse"
+        yield "triton.backends.ascend.reuse.dsl"
         if mod.check_env_flag("TRITON_BUILD_TD", "OFF"):
             distributed_pkg_root = os.path.join("third_party", "ascend", "Triton-distributed-ascend", "python",
                                                 "triton_dist")
