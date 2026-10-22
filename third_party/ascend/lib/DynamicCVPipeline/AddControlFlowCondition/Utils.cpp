@@ -403,7 +403,7 @@ scf::WhileOp createNewWhileOpWithExtras(scf::WhileOp oldWhileOp,
   SmallVector<Type> newResultTypes(oldWhileOp->getResultTypes().begin(),
                                    oldWhileOp->getResultTypes().end());
   for (Value v : extraInitArgs) {
-    newResultTypes.push_back(v.getType());
+    resultTypes.push_back(v.getType());
   }
 
   scf::WhileOp newWhileOp = builder.create<scf::WhileOp>(
@@ -420,9 +420,11 @@ scf::WhileOp createNewWhileOpWithExtras(scf::WhileOp oldWhileOp,
   }
   SmallVector<Location> argLocs(newInits.size(), oldWhileOp.getLoc());
 
-  // Create blocks AND temporarily assign dummy terminators so mightHaveTerminator() never fails
+  // Create blocks with temporary dummy terminators using arith.constant for i1
   Block *beforeBlock = builder.createBlock(&newWhileOp.getBefore(), {}, argTypes, argLocs);
-  builder.create<scf::ConditionOp>(oldWhileOp.getLoc(), builder.getI1AllocatedBool(false), beforeBlock->getArguments());
+  Value dummyBool = builder.create<arith::ConstantOp>(
+      oldWhileOp.getLoc(), builder.getI1Type(), builder.getBoolAttr(false));
+  builder.create<scf::ConditionOp>(oldWhileOp.getLoc(), dummyBool, beforeBlock->getArguments());
 
   Block *afterBlock = builder.createBlock(&newWhileOp.getAfter(), {}, argTypes, argLocs);
   builder.create<scf::YieldOp>(oldWhileOp.getLoc(), afterBlock->getArguments());
