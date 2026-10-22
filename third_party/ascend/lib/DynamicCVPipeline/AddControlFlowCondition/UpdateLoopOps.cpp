@@ -153,14 +153,26 @@ static LogicalResult migrateWhileRegions(scf::WhileOp oldWhileOp,
                                          unsigned numExtraArgs) {
   Block *oldBefore = oldWhileOp.getBeforeBody();
   Block *newBefore = newWhileOp.getBeforeBody();
+  
+  // Remove the dummy terminator before migrating body ops
+  if (!newBefore->empty()) {
+    newBefore->back().erase();
+  }
   migrateBody(oldBefore, newBefore);
+  
   auto oldCond = cast<scf::ConditionOp>(oldBefore->getTerminator());
   oldCond->moveBefore(newBefore, newBefore->end());
   extendWhileCondition(oldCond, newBefore, numOriginalIterArgs, numExtraArgs);
 
   Block *oldAfter = oldWhileOp.getAfterBody();
   Block *newAfter = newWhileOp.getAfterBody();
+  
+  // Remove the dummy terminator before migrating body ops
+  if (!newAfter->empty()) {
+    newAfter->back().erase();
+  }
   migrateBody(oldAfter, newAfter);
+  
   auto oldYield = cast<scf::YieldOp>(oldAfter->getTerminator());
   oldYield->moveBefore(newAfter, newAfter->end());
   extendWhileYield(oldYield, newAfter, numOriginalIterArgs, numExtraArgs);

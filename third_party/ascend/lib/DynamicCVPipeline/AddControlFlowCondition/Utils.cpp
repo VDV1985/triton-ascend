@@ -420,12 +420,15 @@ scf::WhileOp createNewWhileOpWithExtras(scf::WhileOp oldWhileOp,
   }
   SmallVector<Location> argLocs(newInits.size(), oldWhileOp.getLoc());
 
-  builder.createBlock(&newWhileOp.getBefore(), {}, argTypes, argLocs);
-  builder.createBlock(&newWhileOp.getAfter(), {}, argTypes, argLocs);
+  // Create blocks AND temporarily assign dummy terminators so mightHaveTerminator() never fails
+  Block *beforeBlock = builder.createBlock(&newWhileOp.getBefore(), {}, argTypes, argLocs);
+  builder.create<scf::ConditionOp>(oldWhileOp.getLoc(), builder.getI1AllocatedBool(false), beforeBlock->getArguments());
+
+  Block *afterBlock = builder.createBlock(&newWhileOp.getAfter(), {}, argTypes, argLocs);
+  builder.create<scf::YieldOp>(oldWhileOp.getLoc(), afterBlock->getArguments());
 
   return newWhileOp;
 }
-
 // Dispatches createNewForOpWithExtras / createNewWhileOpWithExtras by op type.
 // Returns nullptr if `oldOp` is neither scf.for nor scf.while.
 Operation *createMainLoopOpWithExtras(Operation *oldOp,
