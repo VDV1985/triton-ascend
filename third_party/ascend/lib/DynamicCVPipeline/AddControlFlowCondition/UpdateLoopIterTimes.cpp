@@ -622,13 +622,10 @@ std::pair<int, int> UpdateLoopIterTimesPass::calculateIterDepsFactor(
       int comsumerIdx = consumerIt->second;
 
       if (producerIdx <= comsumerIdx) {
-        LDBG("Producer IfOp index (producerIdx) is not greater than consumer "
-             "IfOp index "
-             "(comsumerIdx)!");
-        LDBG("arg value: " << relation.iterArg);
-        LDBG("Producer IfOp index producerIdx: " << producerIdx);
-        LDBG("consumer IfOp index comsumerIdx: " << comsumerIdx);
-        return {-1, -1};
+        LDBG("Producer IfOp index (producerIdx) <= consumer IfOp index "
+             "(comsumerIdx), skipping iter-dep extension for: "
+             << relation.iterArg);
+        continue;
       }
       int requiredBuffers = producerIdx - comsumerIdx + 1;
       LDBG("consumerIfOp : " << consumerIfOp);

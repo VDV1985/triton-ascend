@@ -164,7 +164,9 @@ cloneOpsForBlock(int curId, SmallVector<Operation *> &curOps,
   if (failed(topologicalSort(curOps))) {
     return failure();
   }
-
+  for (size_t i = 1; i < curOps.size(); ++i) {
+    curOps[i]->moveAfter(curOps[i - 1]);
+  }
   return success();
 }
 
@@ -322,34 +324,15 @@ cleanupClonedOps(Operation *mainLoopOp, Block *bodyBlock,
     }
 
     // Find last index of cloned ops
-    int startIdx = -1;
-    for (int j = curOps.size() - 1; j >= 0; --j) {
-      if (curOps[j]->hasAttr(CVPipeline::kClone)) {
-        startIdx = j;
-        break;
+    SmallVector<Operation *> clonedOps;
+    for (Operation *op : curOps) {
+      if (op->hasAttr(CVPipeline::kClone)) {
+        clonedOps.push_back(op);
       }
     }
-    if (startIdx < 0) {
+    if (clonedOps.empty()) {
       continue;
     }
-
-    // Locate the start of the contiguous cloned-op suffix; the original
-    // cleanup broke at the first non-cloned op, so keep that same set.
-    int firstClonedIdx = 0;
-    for (int j = startIdx - 1; j >= 0; --j) {
-      if (!curOps[j]->hasAttr(CVPipeline::kClone)) {
-        firstClonedIdx = j + 1;
-        break;
-      }
-    }
-
-    // Collect the cloned ops in the contiguous suffix (in execution order).
-    SmallVector<Operation *> clonedOps;
-    clonedOps.reserve(startIdx - firstClonedIdx + 1);
-    for (int j = firstClonedIdx; j <= startIdx; ++j) {
-      clonedOps.push_back(curOps[j]);
-    }
-
     // Build the MemoryDependenceGraph at most once per block, only if a cloned
     // op has no results (only Rule 3 needs it; Rule 2 SSA, Rule 1 type-based).
     MemDepGraph memGraph;
@@ -392,8 +375,8 @@ cleanupClonedOps(Operation *mainLoopOp, Block *bodyBlock,
     // Erase cloned ops bottom-to-top (original ordering); erasedOps makes an
     // already-erased op count as absent from the precomputed exec-after sets.
     llvm::DenseSet<Operation *> erasedOps;
-    for (int j = startIdx; j >= firstClonedIdx; --j) {
-      Operation *op = curOps[j];
+    for (int j = static_cast<int>(clonedOps.size()) - 1; j >= 0; --j) {
+      Operation *op = clonedOps[j];
       bool shouldErase =
           isCube ? shouldEraseOpForCube(op, sameBlockIdExecAfter, erasedOps)
                  : shouldEraseOpForVector(op);

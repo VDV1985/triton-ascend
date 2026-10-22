@@ -61,39 +61,49 @@ static bool isUsedOutsideRegion(Value v,
 }
 
 // Find iter_arg in main loop for `v` (yield operand idx = body arg position).
+// Replace lines 63-100 in CreateIfOps_2.cpp:
 static Value findIterArgInMainLoop(Value v, mlir::Type t) {
-  for (Operation *user : v.getUsers()) {
-    auto yieldOp = dyn_cast<scf::YieldOp>(user);
-    if (!yieldOp) {
-      continue;
-    }
+  SmallVector<Value, 8> worklist{v};
+  llvm::SmallPtrSet<Value, 16> visited{v};
 
-    SmallVector<Value> iterArgs =
-        MainLoop(yieldOp->getParentOp()).getIterArgs();
-    if (iterArgs.empty()) {
-      continue;
-    }
-
-    for (auto [idx, operand] : llvm::enumerate(yieldOp.getOperands())) {
-      if (operand.getAsOpaquePointer() == v.getAsOpaquePointer()) {
-        if (idx >= iterArgs.size()) {
-          LDBG("[Error]: yield operand index "
-               << idx << " out of range for iter_args size "
-               << iterArgs.size());
+  // Use BFS index (head) so direct scf.if/scf.yield forwarding is found
+  // before longer arithmetic chains (e.g., m_i -> alpha -> l_i)
+  for (size_t head = 0; head < worklist.size(); ++head) {
+    Value curr = worklist[head];
+    for (OpOperand &use : curr.getUses()) {
+      Operation *user = use.getOwner();
+      if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
+        Operation *parentOp = yieldOp->getParentOp();
+        if (CVPipeline::isMainLoopOp(parentOp)) {
+          SmallVector<Value> iterArgs = MainLoop(parentOp).getIterArgs();
+          unsigned idx = use.getOperandNumber();
+          if (idx < iterArgs.size() && iterArgs[idx].getType() == t) {
+            return iterArgs[idx];
+          }
           continue;
         }
-        Value iterArg = iterArgs[idx];
-        if (iterArg.getType() == t) {
-          return iterArg;
+        // If it's a nested scf.if yield, follow the corresponding IfOp result
+        if (auto parentIf = dyn_cast<scf::IfOp>(parentOp)) {
+          unsigned idx = use.getOperandNumber();
+          if (idx < parentIf.getNumResults()) {
+            Value ifRes = parentIf.getResult(idx);
+            if (visited.insert(ifRes).second)
+              worklist.push_back(ifRes);
+          }
+          continue;
+        }
+      }
+      // Follow SSA results within the same main_loop body
+      for (Value res : user->getResults()) {
+        if (res.getType() == t && visited.insert(res).second) {
+          worklist.push_back(res);
         }
       }
     }
   }
-
   LDBG("[Error]: else yield value not found in forOp/whileOp iter_args: " << v);
   return nullptr;
 }
-
 // Replace uses of old values that are outside the ifOp with the new values from
 // ifOp
 static LogicalResult replaceExternalIfOpUses(scf::IfOp ifOp,

@@ -610,9 +610,32 @@ LogicalResult UpdateLoopOpsPass::analyzeTensorIterArgDependencies(
 
         // Only the direct terminator of this ssbuffer.if is a producer.
         // Nested if/for/while yields that forward iter_arg are consumers.
-        bool isProducer = isa<scf::YieldOp>(user) &&
-                          user->getParentOp() == ifOp.getOperation();
-
+        bool isProducer = false;
+        Operation *currYieldUser = user;
+        Value yieldedVal = iterArg;
+        while (auto yOp = dyn_cast<scf::YieldOp>(currYieldUser)) {
+          Operation *pOp = yOp->getParentOp();
+          if (pOp == ifOp.getOperation()) {
+            isProducer = true;
+            break;
+          }
+          if (auto nestedIf = dyn_cast<scf::IfOp>(pOp)) {
+            int opIdx = -1;
+            for (unsigned i = 0; i < yOp.getNumOperands(); ++i) {
+              if (yOp.getOperand(i) == yieldedVal) {
+                opIdx = i;
+                break;
+              }
+            }
+            if (opIdx >= 0 && opIdx < (int)nestedIf.getNumResults() &&
+                nestedIf.getResult(opIdx).hasOneUse()) {
+              yieldedVal = nestedIf.getResult(opIdx);
+              currYieldUser = *yieldedVal.getUsers().begin();
+              continue;
+            }
+          }
+          break;
+        }
         // Check and update status of ifOp
         if (isProducer) {
           if (producerIfOp && producerIfOp != ifOp) {

@@ -106,14 +106,19 @@ dfsTopologicalSort(Operation *op, llvm::DenseSet<Operation *> &visited,
   inStack.insert(op);
 
   SmallVector<Operation *> deps;
-  for (Value operand : op->getOperands()) {
-    if (Operation *def = operand.getDefiningOp()) {
-      if (ops.contains(def)) {
-        deps.push_back(def);
+    op->walk([&](Operation *nested) {
+      for (Value operand : nested->getOperands()) {
+        if (Operation *def = operand.getDefiningOp()) {
+          Operation *topDef = def;
+          while (topDef && !ops.contains(topDef)) {
+            topDef = topDef->getParentOp();
+          }
+          if (topDef && topDef != op && !llvm::is_contained(deps, topDef)) {
+            deps.push_back(topDef);
+          }
+        }
       }
-    }
-  }
-
+    });
   if (opOrder && !opOrder->empty()) {
     llvm::sort(deps, [&](Operation *a, Operation *b) {
       auto itA = opOrder->find(a);

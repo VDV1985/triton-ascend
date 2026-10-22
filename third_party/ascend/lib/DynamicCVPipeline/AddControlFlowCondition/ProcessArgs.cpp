@@ -138,8 +138,11 @@ static void collectChainOps(Operation *loopOp, Operation *compOp,
     op->walk([&](Operation *nestOp) {
       for (Value operand : nestOp->getOperands()) {
         if (auto *defOp = operand.getDefiningOp()) {
-          if (defOp->getParentOp() == loopOp && !chainOps.contains(defOp)) {
-            worklist.push_back(defOp);
+          Operation *curr = defOp;
+          while (curr && curr->getParentOp() != loopOp)
+            curr = curr->getParentOp();
+          if (curr && curr->getParentOp() == loopOp && !chainOps.contains(curr)) {
+            worklist.push_back(curr);
           }
         }
       }
@@ -190,22 +193,20 @@ cloneChainForBlock(SharedArgInfo &info, Operation *compOp,
   }
 
   for (Operation *op : sortedChain) {
-    IRMapping opMapper;
-    for (OpOperand &operand : op->getOpOperands()) {
-      Value oldVal = operand.get();
-      Value newVal = oldVal;
-      if (argRemapping.contains(oldVal)) {
-        newVal = argRemapping.lookup(oldVal);
-      } else if (resultMapper.contains(oldVal)) {
-        // Operand is a result from earlier in the owner chain, use cloned
-        // result
-        newVal = resultMapper.lookup(oldVal);
-      }
-      opMapper.map(oldVal, newVal);
-    }
-
-    if (resultMapper.contains(op->getResult(0)))
+    if (op->getNumResults() > 0 && resultMapper.contains(op->getResult(0)))
       continue;
+
+    IRMapping opMapper;
+    op->walk([&](Operation *nested) {
+      for (OpOperand &operand : nested->getOpOperands()) {
+        Value oldVal = operand.get();
+        if (argRemapping.contains(oldVal)) {
+          opMapper.map(oldVal, argRemapping.lookup(oldVal));
+        } else if (resultMapper.contains(oldVal)) {
+          opMapper.map(oldVal, resultMapper.lookup(oldVal));
+        }
+      }
+    });
 
     Operation *cloned = cloneBuilder.clone(*op, opMapper);
     if (!cloned) {
@@ -217,7 +218,10 @@ cloneChainForBlock(SharedArgInfo &info, Operation *compOp,
     cloned->setAttr(CVPipeline::kArg,
                     cloneBuilder.getI32IntegerAttr(info.argIndex));
 
-    resultMapper.map(op->getResult(0), cloned->getResult(0));
+    for (auto [oldRes, newRes] :
+         llvm::zip(op->getResults(), cloned->getResults())) {
+      resultMapper.map(oldRes, newRes);
+    }
     cloneBuilder.setInsertionPointAfter(cloned);
   }
   return success();
@@ -303,8 +307,9 @@ static LogicalResult processSharedArgsIteration(
       continue;
     }
 
-    Value clonedResult =
-        resultMapper.lookup(sharedArgToCompOp.lookup(argIndex)->getResult(0));
+    auto yieldOp = cast<scf::YieldOp>(newBlock->getTerminator());
+    Value origYieldVal = yieldOp.getOperand(argIndex);
+    Value clonedResult = resultMapper.lookupOrDefault(origYieldVal);
     clonedResults.push_back(clonedResult);
     clonedArgIdx++;
   }
