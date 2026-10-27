@@ -75,7 +75,6 @@ else()
   set(TRITON_ASCEND_HAS_INPROC_COSTMODEL 0)
 endif()
 
-add_subdirectory(bin)
 add_subdirectory(include)
 add_subdirectory(lib)
 
