@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
+import concurrent.futures
 import ctypes
 import functools
 import hashlib
@@ -397,6 +398,59 @@ def _parse_cv_pipeline_output(log_text: str, mlir_text: str) -> Dict[str, Any]:
     return metrics
 
 
+def _get_variant_threads() -> int:
+    """Number of candidates the variant search scores at once.
+
+    1 (the default) is the historical serial search. The value is a ceiling,
+    not a request: the search never scores more candidates at once than there
+    are candidates."""
+    val = _get_env_int("TRITON_ASCEND_CV_VARIANT_THREADS")
+    return val if val is not None and val >= 1 else 1
+
+
+def _run_variant_seed_trial(triton_opt: str, src_path: str, pipeline_str: str, seed: int,
+                            log_dir: str, trial_out: str, seed_timeout: int) -> Dict[str, Any]:
+    """Score one candidate: run triton-opt for this seed and parse what it
+    left behind. Returns the per-seed facts the ranking consumes and decides
+    nothing, which is what lets several seeds be scored at once."""
+    trial = {
+        "seed": seed,
+        "timed_out": False,
+        "returncode": 0,
+    }
+
+    log_file = os.path.join(log_dir, f"seed_{seed}.log")
+    cmd = [
+        triton_opt,
+        src_path,
+        f"--pass-pipeline={pipeline_str}",
+        "--mlir-print-debuginfo",
+        "-o",
+        trial_out,
+    ]
+    trial_env = os.environ.copy()
+    trial_env["TRITON_ASCEND_CV_VARIANTS"] = "1"
+    trial_env["TRITON_ASCEND_REORDER_SEED"] = str(seed)
+    trial_env["TRITON_ASCEND_CV_COST_VERBOSE"] = "2"
+
+    with open(log_file, "w", encoding="utf-8") as lf:
+        try:
+            ret = subprocess.run(cmd, env=trial_env, stdout=lf, stderr=subprocess.STDOUT, timeout=seed_timeout)
+        except subprocess.TimeoutExpired:
+            trial["timed_out"] = True
+            lf.write(f"\n[AddDynamicCVPipeline] ERROR: Seed {seed} timed out after {seed_timeout} seconds.\n")
+            lf.flush()
+
+    if trial["timed_out"]:
+        return trial
+
+    trial["returncode"] = ret.returncode
+    log_text = Path(log_file).read_text(encoding="utf-8", errors="replace")
+    mlir_text = Path(trial_out).read_text(encoding="utf-8", errors="replace") if os.path.exists(trial_out) else ""
+    trial.update(_parse_cv_pipeline_output(log_text, mlir_text))
+    return trial
+
+
 def _run_dynamic_cv_variant_search(src_path: str, pipeline_str: str, variant_count: int,
                                    metadata: dict) -> Optional[int]:
     triton_opt = _get_triton_opt_path()
@@ -410,7 +464,17 @@ def _run_dynamic_cv_variant_search(src_path: str, pipeline_str: str, variant_cou
         log_dir = os.path.join(tempfile.gettempdir(), f"triton_cv_logs_{hash_prefix}")
     os.makedirs(log_dir, exist_ok=True)
 
-    print(f"[AddDynamicCVPipeline] variant search: trying {variant_count} operation orderings")
+    # How many candidates are scored at once. A number is a ceiling, not a
+    # request: the search never scores more candidates at once than there are
+    # candidates.
+    variant_threads = _get_variant_threads()
+    worker_count = min(variant_threads, variant_count)
+
+    print(f"[AddDynamicCVPipeline] variant search: trying {variant_count} operation orderings", end="")
+    if worker_count > 1:
+        print(f" on {worker_count} thread(s)")
+    else:
+        print()
     sys.stdout.flush()
 
     ub_slack = _get_env_int("TRITON_ASCEND_CV_UB_SLACK_BYTES")
@@ -436,106 +500,104 @@ def _run_dynamic_cv_variant_search(src_path: str, pipeline_str: str, variant_cou
     ub_allowance = 0
 
     with tempfile.TemporaryDirectory() as trial_tmpdir:
-        for seed in range(variant_count):
-            log_file = os.path.join(log_dir, f"seed_{seed}.log")
-            trial_out = os.path.join(trial_tmpdir, f"out_seed_{seed}.mlir")
+        trials = {}
+        if worker_count > 1:
+            # One subprocess per candidate, several in flight at once. Each
+            # trial writes its own log and output file, so the only state they
+            # share is the triton-opt binary, which is read-only from here.
+            # The ranking below replays the collected results in seed order.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = {
+                    executor.submit(
+                        _run_variant_seed_trial, triton_opt, src_path,
+                        pipeline_str, seed, log_dir,
+                        os.path.join(trial_tmpdir, f"out_seed_{seed}.mlir"),
+                        seed_timeout
+                    ): seed
+                    for seed in range(variant_count)
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    trial = future.result()
+                    trials[trial["seed"]] = trial
+        else:
+            for seed in range(variant_count):
+                trials[seed] = _run_variant_seed_trial(
+                    triton_opt, src_path, pipeline_str, seed, log_dir,
+                    os.path.join(trial_tmpdir, f"out_seed_{seed}.mlir"),
+                    seed_timeout
+                )
 
-            cmd = [
-                triton_opt,
-                src_path,
-                f"--pass-pipeline={pipeline_str}",
-                "--mlir-print-debuginfo",
-                "-o",
-                trial_out,
-            ]
+    for seed in range(variant_count):
+        trial = trials[seed]
+        if trial["timed_out"]:
+            print(f"[AddDynamicCVPipeline]   seed {seed}: TIMED OUT (hung for >{seed_timeout}s, skipping)")
+            sys.stdout.flush()
+            failures[-5] = failures.get(-5, 0) + 1
+            continue
 
-            trial_env = os.environ.copy()
-            trial_env["TRITON_ASCEND_CV_VARIANTS"] = "1"
-            trial_env["TRITON_ASCEND_REORDER_SEED"] = str(seed)
-            trial_env["TRITON_ASCEND_CV_COST_VERBOSE"] = "2"
+        err_code = 0
+        accepted = True
 
-            timed_out = False
-            with open(log_file, "w", encoding="utf-8") as lf:
-                try:
-                    ret = subprocess.run(cmd, env=trial_env, stdout=lf, stderr=subprocess.STDOUT, timeout=seed_timeout)
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    lf.write(f"\n[AddDynamicCVPipeline] ERROR: Seed {seed} timed out after {seed_timeout} seconds.\n")
-                    lf.flush()
+        if trial["returncode"] != 0 or trial["has_fallback"] or trial["cost"] is None:
+            accepted = False
+            err_code = trial["err_code"] if trial["err_code"] != 0 else (-1 if trial["returncode"] != 0 else -2)
+        else:
+            cost = trial["cost"]
+            res = trial["resource"]
+            rec = trial["recurrence"]
+            second = min(res, rec) if (res is not None and rec is not None) else cost
+            ub_bytes = trial["ub_bytes"]
+            ub_capacity = trial["ub_capacity"]
+            depth = trial["depth"]
 
-            if timed_out:
-                print(f"[AddDynamicCVPipeline]   seed {seed}: TIMED OUT (hung for >{seed_timeout}s, skipping)")
-                sys.stdout.flush()
-                failures[-5] = failures.get(-5, 0) + 1
-                continue
-
-            log_text = Path(log_file).read_text(encoding="utf-8", errors="replace")
-            mlir_text = Path(trial_out).read_text(encoding="utf-8", errors="replace") if os.path.exists(trial_out) else ""
-
-            metrics = _parse_cv_pipeline_output(log_text, mlir_text)
-            err_code = 0
-            accepted = True
-
-            if ret.returncode != 0 or metrics["has_fallback"] or metrics["cost"] is None:
+            if baseline_ub_peak is not None and ub_bytes > (baseline_ub_peak + ub_allowance):
                 accepted = False
-                err_code = metrics["err_code"] if metrics["err_code"] != 0 else (-1 if ret.returncode != 0 else -2)
+                err_code = -3
+
+            if accepted and baseline_depth is not None and depth > (baseline_depth + stage_slack_val):
+                accepted = False
+                err_code = -4
+
+        if not accepted:
+            failures[err_code] = failures.get(err_code, 0) + 1
+            continue
+
+        usable += 1
+        if seed == 0:
+            baseline_ub_peak = ub_bytes
+            baseline_depth = depth
+            ub_allowance = ub_slack if ub_slack is not None else max(0, ub_capacity - ub_bytes)
+            print(f"[AddDynamicCVPipeline]   baseline: {ub_bytes} bytes of unified buffer live against a "
+                  f"capacity of {ub_capacity}, pipeline depth {depth}; candidates may spend "
+                  f"{ub_allowance} more byte(s) and {stage_slack_val} more stage(s)")
+            sys.stdout.flush()
+
+        distinct_costs.add((cost, second))
+        ranked.append((cost, second, ub_bytes, seed))
+        if cost > worst_cost:
+            worst_cost = cost
+
+        improves = (best_seed < 0)
+        by_tie_break = False
+        if not improves:
+            if _totals_are_tied(cost, best_cost):
+                tied_candidates += 1
+                improves = (second < best_second)
+                by_tie_break = improves
             else:
-                cost = metrics["cost"]
-                res = metrics["resource"]
-                rec = metrics["recurrence"]
-                second = min(res, rec) if (res is not None and rec is not None) else cost
-                ub_bytes = metrics["ub_bytes"]
-                ub_capacity = metrics["ub_capacity"]
-                depth = metrics["depth"]
+                improves = (cost < best_cost)
 
-                if baseline_ub_peak is not None and ub_bytes > (baseline_ub_peak + ub_allowance):
-                    accepted = False
-                    err_code = -3
-
-                if accepted and baseline_depth is not None and depth > (baseline_depth + stage_slack_val):
-                    accepted = False
-                    err_code = -4
-
-            if not accepted:
-                failures[err_code] = failures.get(err_code, 0) + 1
-                continue
-
-            usable += 1
-            if seed == 0:
-                baseline_ub_peak = ub_bytes
-                baseline_depth = depth
-                ub_allowance = ub_slack if ub_slack is not None else max(0, ub_capacity - ub_bytes)
-                print(f"[AddDynamicCVPipeline]   baseline: {ub_bytes} bytes of unified buffer live against a "
-                      f"capacity of {ub_capacity}, pipeline depth {depth}; candidates may spend "
-                      f"{ub_allowance} more byte(s) and {stage_slack_val} more stage(s)")
-                sys.stdout.flush()
-
-            distinct_costs.add((cost, second))
-            ranked.append((cost, second, ub_bytes, seed))
-            if cost > worst_cost:
-                worst_cost = cost
-
-            improves = (best_seed < 0)
-            by_tie_break = False
-            if not improves:
-                if _totals_are_tied(cost, best_cost):
-                    tied_candidates += 1
-                    improves = (second < best_second)
-                    by_tie_break = improves
-                else:
-                    improves = (cost < best_cost)
-
-            if improves:
-                best_seed = seed
-                best_cost = cost
-                best_second = second
-                if by_tie_break:
-                    tie_breaks += 1
-                print(f"[AddDynamicCVPipeline]   seed {seed}: {cost} cycles", end="")
-                if by_tie_break:
-                    print(f" (tied on the total; won on the other bound at {second})", end="")
-                print(" (best so far)")
-                sys.stdout.flush()
+        if improves:
+            best_seed = seed
+            best_cost = cost
+            best_second = second
+            if by_tie_break:
+                tie_breaks += 1
+            print(f"[AddDynamicCVPipeline]   seed {seed}: {cost} cycles", end="")
+            if by_tie_break:
+                print(f" (tied on the total; won on the other bound at {second})", end="")
+            print(" (best so far)")
+            sys.stdout.flush()
 
     print(f"[AddDynamicCVPipeline] variant search: {usable} of {variant_count} ordering(s) compiled", end="")
     if best_seed >= 0:
