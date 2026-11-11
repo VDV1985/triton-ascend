@@ -668,6 +668,11 @@ BlockDataParser::parse(Value operand, BlockData &data, const Location &loc,
     return parseBitcast(bitcastOp, data, loc, rewriter, known);
   } else if (auto extsiOp = operand.getDefiningOp<arith::ExtSIOp>()) {
     return parseExtSI(extsiOp, data, loc, rewriter, known);
+  } else if (auto extuiOp = operand.getDefiningOp<arith::ExtUIOp>()) {
+    // Parse the extended result as numerical data. Forwarding to the input
+    // would lose unsigned semantics, notably true -> 1 for an i1 comparison.
+    parseDynamicOffset<arith::ExtUIOp>(extuiOp, data, loc, rewriter, known);
+    return success();
   } else if (auto truncOp = operand.getDefiningOp<arith::TruncIOp>()) {
     return parseTruncI(truncOp, data, loc, rewriter, known);
   } else if (auto divOp = operand.getDefiningOp<arith::DivSIOp>()) {
@@ -1248,7 +1253,9 @@ void parseDynamicOffset(OpTy op, BlockData &data, const Location &loc,
     // For now, we consider this is UnstrucMemAcc because we have no other info.
     // Visiting other ops may change the type due to more info.
     resShape = shapedResTy.getShape().vec();
-    bool canExtractScalar = false;
+    // A one-element zero-extension result is a dynamic scalar offset.
+    // Extract after the cast to preserve its unsigned semantics.
+    bool canExtractScalar = std::is_same_v<OpTy, arith::ExtUIOp>;
     if constexpr (std::is_same_v<OpTy, triton::LoadOp>) {
       // A single-element tt.load result can extract a scalar when it is
       // unmasked, or masked with an `other` fill value. A mask without
@@ -3250,7 +3257,7 @@ LogicalResult BlockDataParser::rewriteAddPtrToUnstrucMemAcc(
       rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
   auto addptrRes = op.getResult();
   assert(addptrRes.hasOneUse() && "Invalid: tt.addptr has multiple users");
-  auto loadOp = *(addptrRes.user_begin());
+  auto memoryOp = *(addptrRes.user_begin());
 
   // Prepare empty tensor for loop based scalar load
   // FIXME: We use cast here because addptr must return tensor<?x!tt.ptr<f32>>.
@@ -3276,7 +3283,11 @@ LogicalResult BlockDataParser::rewriteAddPtrToUnstrucMemAcc(
   }
   SmallVector<Value> ivs;
   bool castFailed = false;
-  OpBuilder builder(op);
+  // Keep the access after its operand definitions and preceding memory effects.
+  OpBuilder builder(memoryOp->getContext());
+  // The body builder moves memoryOp before the outer loop is inserted, so use
+  // the following operation as the insertion point.
+  builder.setInsertionPointAfter(memoryOp);
   auto loop = createNestedLoops(
       builder, loc, 0, blockSizes.size(), forLBs, forUBs, forSteps, ivs,
       initArgs,
@@ -3311,9 +3322,9 @@ LogicalResult BlockDataParser::rewriteAddPtrToUnstrucMemAcc(
           return;
         }
         rewriter.replaceOp(op, (*castOp).getResult());
-        // Move tt.load using this tt.addptr into this block
-        loadOp->moveAfter((*castOp).getOperation());
-        loadOp->setAttr("IndirectLoad", UnitAttr::get(op.getContext()));
+        // Move the load or store using this tt.addptr into the scalar loop.
+        memoryOp->moveAfter((*castOp).getOperation());
+        memoryOp->setAttr("IndirectLoad", UnitAttr::get(op.getContext()));
         bB.create<scf::YieldOp>(bLoc, iterArgs);
       });
   if (castFailed)

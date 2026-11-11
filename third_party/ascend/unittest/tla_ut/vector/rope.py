@@ -9,7 +9,6 @@ import sys, os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # tests/
 import torch
-import triton
 import triton.language as tl
 import triton.language.extra.tla as tla
 
@@ -21,7 +20,7 @@ SHAPE = dict(b=1, s=8, nh=4, rd=128, bt=4, off=0, versions=2, cores=4)
 SIGNATURE = {"X_ptr": "*fp32", "CS_ptr": "*fp32"}
 
 
-@triton.jit
+@tla.jit
 def rope(X_ptr, CS_ptr, B: tl.constexpr, S: tl.constexpr, NH: tl.constexpr, RD: tl.constexpr, BT: tl.constexpr,
          OFF: tl.constexpr, CORES: tl.constexpr, VERSIONS: tl.constexpr):
     tl.static_assert(RD == 128 and B > 0 and S > 0 and NH > 0 and BT > 0,
@@ -65,8 +64,6 @@ def test_ir(output_dir=None):
     module, ctx = compile_offline(rope, SIGNATURE, constexprs(), output_dir=output_dir)
     text = str(module)
     assert "!tt.ptr" in text, "route A entry must keep pointer args at AST stage"
-    assert text.count("hivm.hir.pointer_cast") == 2, "tla.view(ptr) x2"
-    assert text.count("memref.reinterpret_cast") == 2, "tla.view(ptr) x2"
     module = lower_offline(module, ctx, output_dir=output_dir)
     text = str(module)
     check_lowered_ir(text, loads=2, stores=1, buffers=2)

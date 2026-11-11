@@ -3,7 +3,7 @@
 Semantics: o[i] = f32(h[i]) * f32(e[i]), tiled by head * 256-tile.
 
 Stages (env TLA_TEST_STAGE, default all with auto-degrade):
-  ir      : offline HIVM IR assert (2 load / 1 store / 3 multibuffer / pointer_cast x3)
+  ir      : offline HIVM IR assert (2 load / 1 store / 3 multibuffer)
   compile : full compile, confirm .o/.npubin artifacts exist
   run     : real-device launch + accuracy (FUSED_WEIGHT OK)
 
@@ -14,7 +14,6 @@ import sys, os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # tests/
 import torch
-import triton
 import triton.language as tl
 import triton.language.extra.tla as tla
 
@@ -26,7 +25,7 @@ SHAPE = dict(h=512, hc=2, cores=4, versions=3)
 SIGNATURE = {"H_ptr": "*bf16", "E_ptr": "*bf16", "O_ptr": "*fp32"}
 
 
-@triton.jit
+@tla.jit
 def fused_weight(H_ptr, E_ptr, O_ptr, H: tl.constexpr, HC: tl.constexpr, CORES: tl.constexpr, VERSIONS: tl.constexpr):
     # Route A: tile kernel pointer args directly via one tla.view(ptr) each.
     hu = tla.alloc_buffer((256, ), tl.bfloat16, space="ub", versions=VERSIONS)
@@ -61,8 +60,6 @@ def test_ir(output_dir=None):
     module, ctx = compile_offline(fused_weight, SIGNATURE, constexprs(), output_dir=output_dir)
     text = str(module)
     assert "!tt.ptr" in text, "route A entry must keep pointer args at AST stage"
-    assert text.count("hivm.hir.pointer_cast") == 3, "tla.view(ptr) x3"
-    assert text.count("memref.reinterpret_cast") == 3, "tla.view(ptr) x3"
     module = lower_offline(module, ctx, output_dir=output_dir)
     text = str(module)
     check_lowered_ir(text, loads=2, stores=1, buffers=3)

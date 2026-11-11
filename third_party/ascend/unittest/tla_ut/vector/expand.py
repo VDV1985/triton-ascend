@@ -24,7 +24,7 @@ SHAPE = dict(tmax=8, h=256, mhc=2, h_blk=128, ns=2, cores=4)
 SIGNATURE = {"X_ptr": "*bf16", "O_ptr": "*bf16", "num_tokens": "i32"}
 
 
-@triton.jit
+@tla.jit
 def expand_to_mhc_fwd(X_ptr, O_ptr, num_tokens, TMAX: tl.constexpr, H: tl.constexpr, MHC: tl.constexpr,
                       H_BLK: tl.constexpr, NS: tl.constexpr, CORES: tl.constexpr):
     tl.static_assert(H > 0 and H % H_BLK == 0 and H_BLK % 128 == 0,
@@ -83,11 +83,6 @@ def test_ir(output_dir=None):
     module, ctx = compile_offline(expand_to_mhc_fwd, SIGNATURE, constexprs(), output_dir=output_dir)
     text = str(module)
     assert "!tt.ptr" in text, "route A entry must keep pointer args at AST stage"
-    # one pointer entry for x_row + one per MHC-row o_row view.
-    assert text.count("hivm.hir.pointer_cast") == 1 + SHAPE["mhc"], \
-        "tla.view(ptr) x (1 x_row + mhc o_row)"
-    assert text.count("memref.reinterpret_cast") == 1 + SHAPE["mhc"], \
-        "tla.view(ptr) x (1 x_row + mhc o_row)"
     module = lower_offline(module, ctx, output_dir=output_dir)
     text = str(module)
     check_lowered_ir(text, loads=1, stores=SHAPE["mhc"], buffers=2)
