@@ -10,7 +10,7 @@
 
 using namespace mlir;
 
-namespace mlir::triton::CVSplit {
+namespace mlir::CVPipeline {
 
 DemoteExtReduceTruncPattern::DemoteExtReduceTruncPattern(MLIRContext *ctx,
                                                          bool enabled)
@@ -129,4 +129,4 @@ DemoteExtReduceTruncPattern::matchAndRewrite(arith::TruncFOp truncOp,
   return success();
 }
 
-} // namespace mlir::triton::CVSplit
+} // namespace mlir::CVPipeline

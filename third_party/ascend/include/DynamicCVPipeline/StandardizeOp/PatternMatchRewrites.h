@@ -61,24 +61,6 @@ private:
   bool enabled;
 };
 
-class PatternMatchRewritePass
-    : public PassWrapper<PatternMatchRewritePass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PatternMatchRewritePass);
-
-  PatternMatchRewritePass() = default;
-  void runOnOperation() override;
-
-  void getDependentDialects(mlir::DialectRegistry &registry) const override {
-    registry.insert<mlir::linalg::LinalgDialect, mlir::arith::ArithDialect,
-                    mlir::tensor::TensorDialect>();
-  }
-
-  [[nodiscard]] llvm::StringRef getArgument() const final {
-    return "ssbuf-standardize-op-pattern-match";
-  }
-};
-
 std::unique_ptr<OperationPass<ModuleOp>> createPatternMatchRewritePass();
 
 } // namespace mlir::CVPipeline
