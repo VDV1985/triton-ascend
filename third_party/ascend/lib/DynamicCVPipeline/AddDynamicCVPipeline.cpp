@@ -41,6 +41,7 @@
 #include "llvm/Support/Debug.h"
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <thread>
 
@@ -409,12 +410,17 @@ void prepareVariantSearchDialects(MLIRContext *context,
 /// serial search took by hand: the total, the bound that decided ties, and
 /// the two figures the baseline guards are written against.
 VariantScore runVariantTrial(MLIRContext *context, ModuleOp moduleBackup,
-                            int mainLoopUnrollFactor, int64_t seed) {
+                            int mainLoopUnrollFactor, int64_t seed,
+                            std::mutex &cloneMutex) {
   VariantScore score;
   score.seed = seed;
 
   OpBuilder builder(context);
-  ModuleOp attempt(moduleBackup->clone());
+  ModuleOp attempt;
+  {
+    std::lock_guard<std::mutex> lock(cloneMutex);
+    attempt = moduleBackup->clone();
+  }
   attempt->setAttr(CVPipeline::kReorderSeed, builder.getI64IntegerAttr(seed));
   attempt->setAttr(mlir::triton::kCVPipelineCostQuiet, builder.getUnitAttr());
 
@@ -547,6 +553,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     const std::optional<int64_t> ubSlack = getUBSlackBytes();
     const std::optional<int64_t> stageSlack = getStageSlack();
     SmallVector<VariantScore> scores(variantCount);
+    std::mutex cloneMutex;
 
     {
       // Nothing a trial prints is worth reading: it describes IR that is
@@ -559,13 +566,16 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       // other.
       OutputSilencer hush;
       if (threadCount > 1) {
+        // Run seed 0 first so the baseline reference is established deterministically.
+        scores[0] = runVariantTrial(&getContext(), moduleBackup,
+                                    this->mainLoopUnrollFactor, 0, cloneMutex);
         // The workers are plain std::thread rather than a borrow from the
         // context's pool: that pool is sized for the machine, and how many
         // candidates are scored at once is a property of the search. (The
         // standalone llvm::ThreadPool has been removed from recent LLVM, so
         // the search carries its own tiny pool: a counter, a vector of
         // threads, and a join.)
-        std::atomic<int64_t> nextSeed(0);
+        std::atomic<int64_t> nextSeed(1);
         SmallVector<std::thread> workers;
         workers.reserve(threadCount);
         for (int worker = 0; worker < threadCount; ++worker) {
@@ -576,7 +586,8 @@ void AddDynamicCVPipelinePass::runOnOperation() {
                 break;
               }
               scores[seed] = runVariantTrial(&getContext(), moduleBackup,
-                                             this->mainLoopUnrollFactor, seed);
+                                             this->mainLoopUnrollFactor, seed,
+                                             cloneMutex);
             }
           });
         }
@@ -587,7 +598,8 @@ void AddDynamicCVPipelinePass::runOnOperation() {
         for (int64_t seed = 0; seed < variantCount; ++seed) {
           scores[seed] =
               runVariantTrial(&getContext(), moduleBackup,
-                              this->mainLoopUnrollFactor, seed);
+                              this->mainLoopUnrollFactor, seed,
+                              cloneMutex);
         }
       }
     }
