@@ -80,6 +80,7 @@ void RemoveSsbufAttrPass::runOnOperation() {
   // visits its own root, and because hivmc rejects module attrs it does not
   // recognise.
   module->removeAttr(kBlockDeps);
+  module->removeAttr("ssbuffer.variant_hash");
 }
 
 namespace mlir::triton {

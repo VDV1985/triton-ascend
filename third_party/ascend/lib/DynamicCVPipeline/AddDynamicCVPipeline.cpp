@@ -361,6 +361,30 @@ static inline void addPasses(OpPassManager &pm, int mainLoopUnrollFactor = 0) {
   pm.addPass(createRemoveSsbufAttrPass());
 }
 
+static inline void addEarlyPasses(OpPassManager &pm,
+                                  int mainLoopUnrollFactor = 0) {
+  if (mainLoopUnrollFactor > 1) {
+    MainLoopUnrollOptions unrollOptions;
+    unrollOptions.unrollFactor = mainLoopUnrollFactor;
+    pm.addPass(createMainLoopUnrollPass(unrollOptions));
+    pm.addPass(createCanonicalizerPass());
+  }
+  pm.addPass(createPreCheckAvailablePass());
+  pm.addPass(createStandardizeOpPass());
+  pm.addPass(createPlanComputeBlockPass());
+}
+
+static inline void addLatePasses(OpPassManager &pm) {
+  pm.addPass(createComputeBlockOptPass());
+  pm.addPass(createSplitDataflowPass());
+  pm.addPass(createAnalyzeDataFlowPass());
+  pm.addPass(createAllocMultiCachePass());
+  pm.addPass(createAddControlFlowConditionPass());
+  pm.addPass(createSeparateMemoryFromComputePass());
+  pm.addPass(createEstimateCVPipelineCostPass());
+  pm.addPass(createRemoveSsbufAttrPass());
+}
+
 /// The result of one candidate: its score, or the reason it was not scored.
 /// Everything here is a plain number, which is what makes the result safe to
 /// hand back from a worker to the thread that ranks it.
@@ -411,21 +435,46 @@ void prepareVariantSearchDialects(MLIRContext *context,
 /// the two figures the baseline guards are written against.
 VariantScore runVariantTrial(MLIRContext *context, ModuleOp moduleBackup,
                             int mainLoopUnrollFactor, int64_t seed,
-                            std::mutex &cloneMutex) {
+                            llvm::DenseMap<uint64_t, int64_t> &minSeedByHash,
+                            std::mutex &trialMutex) {
   VariantScore score;
   score.seed = seed;
 
   OpBuilder builder(context);
-  std::lock_guard<std::mutex> lock(cloneMutex);
+  std::lock_guard<std::mutex> lock(trialMutex);
   ModuleOp attempt(moduleBackup->clone());
   
   attempt->setAttr(CVPipeline::kReorderSeed, builder.getI64IntegerAttr(seed));
   attempt->setAttr(mlir::triton::kCVPipelineCostQuiet, builder.getUnitAttr());
 
-  PassManager trial(context, attempt.getOperationName());
-  addPasses(trial, mainLoopUnrollFactor);
+  PassManager earlyTrial(context, attempt.getOperationName());
+  addEarlyPasses(earlyTrial, mainLoopUnrollFactor);
+  const bool earlyRan =
+      succeeded(earlyTrial.run(attempt.getOperation())) &&
+      !CVPipeline::hasFallbackAttr(attempt);
+  if (earlyRan) {
+    if (auto hashAttr =
+            attempt->getAttrOfType<IntegerAttr>("ssbuffer.variant_hash")) {
+      const uint64_t sig = static_cast<uint64_t>(hashAttr.getInt());
+      std::lock_guard<std::mutex> lock(trialMutex);
+      auto [it, inserted] = minSeedByHash.try_emplace(sig, seed);
+      if (!inserted) {
+        if (seed > it->second) {
+          // -5: duplicate block partition already explored by an earlier seed.
+          score.errCode = -5;
+          attempt->destroy();
+          return score;
+        }
+        it->second = seed;
+      }
+    }
+  }
+
+  PassManager lateTrial(context, attempt.getOperationName());
+  addLatePasses(lateTrial);
   const bool ran =
-      succeeded(trial.run(attempt.getOperation())) &&
+      earlyRan &&
+      succeeded(lateTrial.run(attempt.getOperation())) &&
       !CVPipeline::hasFallbackAttr(attempt);
   if (!ran) {
     auto codeAttr =
@@ -551,7 +600,8 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     const std::optional<int64_t> ubSlack = getUBSlackBytes();
     const std::optional<int64_t> stageSlack = getStageSlack();
     SmallVector<VariantScore> scores(variantCount);
-    std::mutex cloneMutex;
+    llvm::DenseMap<uint64_t, int64_t> minSeedByHash;
+    std::mutex trialMutex;
 
     {
       // Nothing a trial prints is worth reading: it describes IR that is
@@ -566,7 +616,8 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       if (threadCount > 1) {
         // Run seed 0 first so the baseline reference is established deterministically.
         scores[0] = runVariantTrial(&getContext(), moduleBackup,
-                                    this->mainLoopUnrollFactor, 0, cloneMutex);
+                                    this->mainLoopUnrollFactor, 0,
+                                    minSeedByHash, trialMutex);
         // The workers are plain std::thread rather than a borrow from the
         // context's pool: that pool is sized for the machine, and how many
         // candidates are scored at once is a property of the search. (The
@@ -585,7 +636,8 @@ void AddDynamicCVPipelinePass::runOnOperation() {
               }
               scores[seed] = runVariantTrial(&getContext(), moduleBackup,
                                              this->mainLoopUnrollFactor, seed,
-                                             cloneMutex);
+                                             minSeedByHash,
+                                             trialMutex);
             }
           });
         }
@@ -597,7 +649,8 @@ void AddDynamicCVPipelinePass::runOnOperation() {
           scores[seed] =
               runVariantTrial(&getContext(), moduleBackup,
                               this->mainLoopUnrollFactor, seed,
-                              cloneMutex);
+                              minSeedByHash,
+                              trialMutex);
         }
       }
     }
@@ -614,6 +667,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     // The bound the total did not come from, for the winner. Used only to
     // separate candidates whose totals tie.
     int64_t bestSecond = 0;
+    int64_t bestUBBytes = 0;
     int64_t worstCost = 0;
     int64_t usable = 0;
     // How often the second bound was what decided. A search that never used it
@@ -736,7 +790,11 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       if (!improves) {
         if (totalsAreTied(score.cost, bestCost)) {
           ++tiedCandidates;
-          improves = score.second < bestSecond;
+          if (totalsAreTied(score.second, bestSecond)) {
+            improves = score.ubBytes < bestUBBytes;
+          } else {
+            improves = score.second < bestSecond;
+          }
           byTieBreak = improves;
         } else {
           improves = score.cost < bestCost;
@@ -746,6 +804,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
         bestSeed = seed;
         bestCost = score.cost;
         bestSecond = score.second;
+        bestUBBytes = score.ubBytes;
         if (byTieBreak) {
           ++tieBreaks;
         }
@@ -827,6 +886,9 @@ void AddDynamicCVPipelinePass::runOnOperation() {
                      << baselineDepth.value_or(0)
                      << ", which the binary compiler refuses as a prologue that"
                         " reads a buffer before its first write\n";
+      } else if (entry.first == -5) {
+        llvm::errs() << "an identical block partition to an earlier seed"
+                        " (short-circuited after PlanComputeBlock)\n";
       } else {
         llvm::errs() << "error code " << entry.first << "\n";
       }

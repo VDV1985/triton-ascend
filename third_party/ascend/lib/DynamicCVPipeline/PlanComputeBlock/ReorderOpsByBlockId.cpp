@@ -970,13 +970,35 @@ size_t pickReadyIndex(SplitMix64 &rng, size_t count) {
   return index;
 }
 
+/// Heuristic weight of an operation and its incoming edge in the critical path.
+unsigned getOpScheduleWeight(Operation *op, CoreType opCore,
+                             CoreType predCore) {
+  unsigned weight = 0;
+  if (llvm::isa<linalg::MatmulOp>(op)) {
+    weight = 5;
+  } else if (llvm::isa<memref::CopyOp, hivm::CopyOp, hivm::FixpipeOp>(op) ||
+             CVPipeline::isStoreLike(op)) {
+    weight = 4;
+  } else if (opCore != CoreType::UNDETERMINED && !CVPipeline::isViewLike(op) &&
+             !llvm::isa<arith::ConstantOp>(op)) {
+    weight = 1;
+  }
+  if (opCore != CoreType::UNDETERMINED && predCore != CoreType::UNDETERMINED &&
+      opCore != predCore) {
+    weight += 10;
+  }
+  return weight;
+}
+
 /// Longest chain of operations that must still run after each operation.
 /// Computed over the reverse graph, so it needs no separate traversal order.
 DenseMap<Operation *, unsigned> computeOpHeights(const BlockOpGraph &graph) {
   DenseMap<Operation *, unsigned> height;
   DenseMap<Operation *, unsigned> outDeg;
+  DenseMap<Operation *, CoreType> core;
   SmallVector<Operation *> queue;
   for (Operation *op : graph.ops) {
+    core[op] = CVPipeline::getOpCoreType(op);
     const unsigned degree = graph.succs.at(op).size();
     outDeg[op] = degree;
     height[op] = 0;
@@ -986,9 +1008,12 @@ DenseMap<Operation *, unsigned> computeOpHeights(const BlockOpGraph &graph) {
   }
   while (!queue.empty()) {
     Operation *op = queue.pop_back_val();
+    const CoreType opCore = core.lookup(op);
     for (Operation *pred : graph.preds.at(op)) {
       unsigned &predHeight = height[pred];
-      predHeight = std::max(predHeight, height[op] + 1);
+      const unsigned stepWeight =
+          getOpScheduleWeight(op, opCore, core.lookup(pred));
+      predHeight = std::max(predHeight, height[op] + stepWeight);
       if (--outDeg[pred] == 0) {
         queue.push_back(pred);
       }
@@ -1006,11 +1031,13 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
   // reading an attribute that often is both slow and pointless.
   DenseMap<Operation *, CoreType> core;
   DenseMap<Operation *, unsigned> inDeg;
+  DenseMap<Operation *, unsigned> remUses;
   SmallVector<Operation *> ready;
   for (Operation *op : graph.ops) {
     core[op] = CVPipeline::getOpCoreType(op);
     const unsigned degree = graph.preds.at(op).size();
     inDeg[op] = degree;
+    remUses[op] = graph.succs.at(op).size();
     if (degree == 0) {
       ready.push_back(op);
     }
@@ -1038,22 +1065,25 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
   // produces a thousand candidates with one score.
   SplitMix64 recipe(seed * 0x9e3779b97f4a7c15ULL + 0x243f6a8885a308d3ULL);
 
-  // What counts as urgent. Longest chain first is the textbook rule; shortest
-  // first clears small work early and delays the critical path, which is
-  // usually worse and occasionally exactly right; program order stays near the
-  // input; random ignores structure altogether.
-  const unsigned priorityMode = static_cast<unsigned>(recipe.next() % 4);
-  // How long one core may run before the other gets a turn. Short runs
-  // interleave the cores finely -- more barriers, more overlap; long runs do
-  // the opposite, and at the extreme serialise the kernel.
-  const size_t targetRun = 1 + static_cast<size_t>(recipe.next() % 32);
-  // Whether to respect runs at all. A quarter of the recipes ignore the core
-  // and let the two interleave freely; most of those end up rejected by the
-  // block-count guard, and the ones that survive are shapes the run-based
-  // rules cannot reach.
-  const bool stickyCore = (recipe.next() % 4) != 0;
-  // How readily a step passes over its best candidate.
-  const unsigned noise = static_cast<unsigned>(recipe.next() % 3);
+  // Seeds 1..4 are deterministic structural probes covering different run
+  // granularities with zero random noise; seeds >= 5 sample around weighted
+  // height or program order without wasting attempts on unsticky or inverted
+  // schedules.
+  unsigned priorityMode = 0;
+  size_t targetRun = 8;
+  const bool stickyCore = true;
+  unsigned noise = 0;
+  if (seed >= 1 && seed <= 4) {
+    static constexpr size_t kProbeRuns[4] = {2, 4, 8, 16};
+    priorityMode = 0;
+    targetRun = kProbeRuns[seed - 1];
+    noise = 0;
+  } else {
+    const uint64_t modeRoll = recipe.next() % 4;
+    priorityMode = (modeRoll < 2) ? 0 : (modeRoll == 2 ? 2 : 3);
+    targetRun = 2 + static_cast<size_t>(recipe.next() % 20);
+    noise = static_cast<unsigned>(recipe.next() % 2);
+  }
 
   // Fixed per operation so that a random priority is still a consistent
   // ordering rather than a coin flip at every comparison.
@@ -1078,11 +1108,25 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
     }
   };
 
+  // Count how many live parent values in the same core this op would retire
+  // immediately (last remaining consumer), reducing live UB pressure.
+  auto countFreedPreds = [&](Operation *op) -> unsigned {
+    unsigned freed = 0;
+    const CoreType opCore = core.lookup(op);
+    for (Operation *pred : graph.preds.at(op)) {
+      if (remUses.lookup(pred) == 1 && core.lookup(pred) == opCore) {
+        ++freed;
+      }
+    }
+    return freed;
+  };
+
   SplitMix64 rng(seed * 0x2545f4914f6cdd1dULL + 1);
   SmallVector<Operation *> order;
   order.reserve(graph.ops.size());
   CoreType currentCore = CoreType::UNDETERMINED;
   size_t opsInRun = 0;
+  bool unlockedOtherCore = false;
   while (!ready.empty()) {
     // Staying on the core that just ran comes before everything else. Without
     // it a height-ordered schedule interleaves Cube and Vector work operation
@@ -1101,7 +1145,13 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
     // one core has work the preference costs nothing: everything compares
     // equal on it and the ordering falls through to the rules below.
     // +1 keep this core going, -1 hand over to the other, 0 do not care.
-    const int corePref = !stickyCore ? 0 : (opsInRun >= targetRun ? -1 : 1);
+    const size_t effectiveTarget =
+        currentCore == CoreType::CUBE_ONLY
+            ? std::max<size_t>(1, targetRun / 2)
+            : targetRun;
+    const bool shouldSwitchCore =
+        opsInRun >= effectiveTarget || (unlockedOtherCore && opsInRun >= 2);
+    const int corePref = !stickyCore ? 0 : (shouldSwitchCore ? -1 : 1);
     llvm::sort(ready, [&](Operation *lhs, Operation *rhs) {
       if (corePref != 0) {
         const bool lhsRuns = continuesRun(lhs, currentCore);
@@ -1114,6 +1164,11 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
       const uint64_t rhsPriority = priorityOf(rhs);
       if (lhsPriority != rhsPriority) {
         return lhsPriority > rhsPriority;
+      }
+      const unsigned lhsFreed = countFreedPreds(lhs);
+      const unsigned rhsFreed = countFreedPreds(rhs);
+      if (lhsFreed != rhsFreed) {
+        return lhsFreed > rhsFreed;
       }
       return graph.opIndex.lookup(lhs) < graph.opIndex.lookup(rhs);
     });
@@ -1130,13 +1185,26 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
     if (chosenCore != CoreType::UNDETERMINED && chosenCore != currentCore) {
       currentCore = chosenCore;
       opsInRun = 1;
-    } else {
+      unlockedOtherCore = false;
+    } else if (chosenCore != CoreType::UNDETERMINED) {
       ++opsInRun;
+    }
+
+    for (Operation *pred : graph.preds.at(chosen)) {
+      auto it = remUses.find(pred);
+      if (it != remUses.end() && it->second > 0) {
+        --it->second;
+      }
     }
 
     for (Operation *succ : graph.succs.at(chosen)) {
       if (--inDeg[succ] == 0) {
         ready.push_back(succ);
+        const CoreType succCore = core.lookup(succ);
+        if (succCore != CoreType::UNDETERMINED &&
+            currentCore != CoreType::UNDETERMINED && succCore != currentCore) {
+          unlockedOtherCore = true;
+        }
       }
     }
   }
@@ -1285,7 +1353,8 @@ static void applyReorder(Block &block, ArrayRef<Operation *> reordered) {
 static llvm::LogicalResult
 reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
                   ComputeBlockIdManager &bm,
-                  std::optional<uint64_t> variantSeed) {
+                  std::optional<uint64_t> variantSeed,
+                  uint64_t &modulePartitionHash) {
   const auto allOps =
       llvm::to_vector(llvm::make_pointer_range(block.without_terminator()));
 
@@ -1330,6 +1399,15 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
     } else {
       rederiveBlockIds(order, bm, opBlockId);
       applyReorder(block, order);
+      // Record the resulting block partition into the rolling module hash so
+      // identical partitions across seeds can be skipped early.
+      for (Operation *op : order) {
+        uint64_t h = static_cast<uint64_t>(graph.opIndex.lookup(op)) ^
+                     (static_cast<uint64_t>(opBlockId.lookup(op)) << 32);
+        modulePartitionHash ^=
+            h + 0x9e3779b97f4a7c15ULL + (modulePartitionHash << 6) +
+            (modulePartitionHash >> 2);
+      }
       if (getReorderVerbosity() >= 1) {
         llvm::errs() << "[reorder-blocks] variant seed " << *variantSeed
                      << ": " << order.size() << " op(s) reordered, " << before
@@ -1346,6 +1424,13 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
   }
 
   applyReorder(block, reorderedRes.value());
+  for (Operation *op : reorderedRes.value()) {
+    uint64_t h = static_cast<uint64_t>(graph.opIndex.lookup(op)) ^
+                 (static_cast<uint64_t>(opBlockId.lookup(op)) << 32);
+    modulePartitionHash ^=
+        h + 0x9e3779b97f4a7c15ULL + (modulePartitionHash << 6) +
+        (modulePartitionHash >> 2);
+  }
 
   // Verify the sync fence invariant: every op that preceded (followed) a
   // gpu.barrier / hivm.sync_block_all in the original source order must still
@@ -1415,6 +1500,7 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
   auto memGraph = MemoryDependenceGraph(moduleOp, aa);
 
   const std::optional<uint64_t> variantSeed = getVariantSeed(moduleOp);
+  uint64_t modulePartitionHash = 0x243f6a8885a308d3ULL;
 
   auto bm = ComputeBlockIdManager(moduleOp);
   auto result = moduleOp.walk([&](Block *block) {
@@ -1425,7 +1511,8 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
           isa<scf::SCFDialect>(parentOp->getDialect()))) {
       return WalkResult::skip();
     }
-    if (llvm::failed(reorderOpsInBlock(*block, memGraph, bm, variantSeed))) {
+    if (llvm::failed(reorderOpsInBlock(*block, memGraph, bm, variantSeed,
+                                       modulePartitionHash))) {
       return WalkResult::interrupt();
     }
     return WalkResult::advance();
@@ -1436,6 +1523,13 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
   // the ordinary block-level path instead of regrouping underneath them.
   if (variantSeed) {
     moduleOp->setAttr(CVPipeline::kReorderSeed, builder.getI64IntegerAttr(-1));
+    moduleOp->setAttr("ssbuffer.variant_hash",
+                      builder.getI64IntegerAttr(
+                          static_cast<int64_t>(modulePartitionHash)));
+  } else if (!moduleOp->hasAttr("ssbuffer.variant_hash")) {
+    moduleOp->setAttr("ssbuffer.variant_hash",
+                      builder.getI64IntegerAttr(
+                          static_cast<int64_t>(modulePartitionHash)));
   }
 
   if (result.wasInterrupted()) {

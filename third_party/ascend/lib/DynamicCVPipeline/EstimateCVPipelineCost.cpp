@@ -966,15 +966,22 @@ std::optional<OpCost> estimateOpCost(Operation *op,
     // bottleneck, which is not.
     if (!isCube && knownSrc.empty() && !destFeedsCube) {
       OpCost cost;
-      cost.unit = HWUnit::VecMTE2;
-      cost.confidence = CostConfidence::NotModelled;
+      cost.unit = HWUnit::Vector;
+      cost.confidence = CostConfidence::Generic;
       // "?" rather than a word: the transfer table gives the path a narrow
       // column, and a long name runs into the operation name beside it.
-      cost.srcSpace = "?";
-      cost.dstSpace = knownDst.empty() ? llvm::StringRef("?") : knownDst;
+      cost.srcSpace = "ub";
+      cost.dstSpace = knownDst.empty() ? llvm::StringRef("ub") : knownDst;
       if (Type sizingType = getTransferSizingType(op)) {
         if (auto bytes = getShapedByteSize(sizingType)) {
           cost.bytes = *bytes;
+        }
+        if (auto elements = getShapedElementCount(sizingType)) {
+          cost.cycles = config.estimateVectorCyclesFromTable(
+              elementsPerVectorCore(*elements,
+                                    config.getVectorCoresPerBlock()),
+              getShapedElementBits(sizingType), "VCOPY");
+          cost.confidence = CostConfidence::Modelled;
         }
       }
       return cost;
@@ -2196,6 +2203,18 @@ double getFusionFactor(const BlockStats &stats, const FusionFactors &fusion) {
   return stats.isCube ? fusion.cube : fusion.vector;
 }
 
+/// Effective fusion multiplier for a segment: a single isolated operation
+/// gets no intra-block register reuse discount (1.0), whereas multi-op segments
+/// pay full cost for the first op and `factor` for the remaining ops.
+double getSegmentFusionMultiplier(const BlockSegment &segment,
+                                  double baseFactor) {
+  if (segment.costedOps <= 1 || baseFactor >= 1.0) {
+    return 1.0;
+  }
+  const double n = static_cast<double>(segment.costedOps);
+  return (1.0 + (n - 1.0) * baseFactor) / n;
+}
+
 /// Cost of one block on its own, after intra-block fusion, summed over its
 /// segments. Segments are serial with respect to each other (a barrier
 /// separates them), so their rooflines add; within a segment the units overlap.
@@ -2206,7 +2225,7 @@ double getFusionFactor(const BlockStats &stats, const FusionFactors &fusion) {
 int64_t computeBlockCycles(const BlockStats &stats,
                            const HardwareConfig &config,
                            const FusionFactors &fusion, bool perIteration) {
-  const double factor = getFusionFactor(stats, fusion);
+  const double baseFactor = getFusionFactor(stats, fusion);
 
   int64_t total = 0;
   for (const BlockSegment &segment : stats.segments) {
@@ -2215,6 +2234,8 @@ int64_t computeBlockCycles(const BlockStats &stats,
     if (units.empty()) {
       continue;
     }
+    const double factor =
+        getSegmentFusionMultiplier(segment, baseFactor);
     total += static_cast<int64_t>(combineRoofline(units, config) * factor);
   }
   return total;
@@ -2458,7 +2479,7 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
       barriers.charge(barrierCycles);
     }
 
-    const double factor = getFusionFactor(stats, fusion);
+    const double baseFactor = getFusionFactor(stats, fusion);
 
     // `cursor` is when the current segment may begin: the dependency-ready
     // time for the first, and the previous segment's end after that.
@@ -2471,6 +2492,8 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
     for (const BlockSegment &segment : stats.segments) {
       const llvm::DenseMap<HWUnit, int64_t> &units =
           perIteration ? segment.unitCyclesOneIter : segment.unitCycles;
+      const double factor =
+          getSegmentFusionMultiplier(segment, baseFactor);
       // A barrier separates this segment from the previous one, so the core
       // pays for it again here. Charged only between segments that both carry
       // work: an empty segment is an artefact of two adjacent sync operations,
