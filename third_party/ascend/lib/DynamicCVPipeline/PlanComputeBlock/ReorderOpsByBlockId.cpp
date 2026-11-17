@@ -1071,7 +1071,7 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
   // schedules.
   unsigned priorityMode = 0;
   size_t targetRun = 8;
-  const bool stickyCore = true;
+  bool stickyCore = true;
   unsigned noise = 0;
   if (seed >= 1 && seed <= 4) {
     static constexpr size_t kProbeRuns[4] = {2, 4, 8, 16};
@@ -1082,6 +1082,7 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
     const uint64_t modeRoll = recipe.next() % 4;
     priorityMode = (modeRoll < 2) ? 0 : (modeRoll == 2 ? 2 : 3);
     targetRun = 2 + static_cast<size_t>(recipe.next() % 20);
+    stickyCore = (recipe.next() % 4) != 0;
     noise = static_cast<unsigned>(recipe.next() % 2);
   }
 
@@ -1121,12 +1122,24 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
     return freed;
   };
 
+  // Only count genuine compute and data-movement operations towards the run
+  // length so lightweight setup ops (alloc, to_tensor, empty, views, constants)
+  // do not prematurely exhaust targetRun and shatter a block.
+  auto countsTowardsRun = [](Operation *op) -> bool {
+    if (CVPipeline::isViewLike(op) ||
+        llvm::isa<memref::AllocOp, memref::AllocaOp, tensor::EmptyOp,
+                  bufferization::AllocTensorOp, bufferization::ToTensorOp,
+                  arith::ConstantOp, annotation::MarkOp>(op)) {
+      return false;
+    }
+    return true;
+  };
+
   SplitMix64 rng(seed * 0x2545f4914f6cdd1dULL + 1);
   SmallVector<Operation *> order;
   order.reserve(graph.ops.size());
   CoreType currentCore = CoreType::UNDETERMINED;
   size_t opsInRun = 0;
-  bool unlockedOtherCore = false;
   while (!ready.empty()) {
     // Staying on the core that just ran comes before everything else. Without
     // it a height-ordered schedule interleaves Cube and Vector work operation
@@ -1149,13 +1162,20 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
         currentCore == CoreType::CUBE_ONLY
             ? std::max<size_t>(1, targetRun / 2)
             : targetRun;
-    const bool shouldSwitchCore =
-        opsInRun >= effectiveTarget || (unlockedOtherCore && opsInRun >= 2);
+    const bool shouldSwitchCore = opsInRun >= effectiveTarget;
     const int corePref = !stickyCore ? 0 : (shouldSwitchCore ? -1 : 1);
     llvm::sort(ready, [&](Operation *lhs, Operation *rhs) {
       if (corePref != 0) {
-        const bool lhsRuns = continuesRun(lhs, currentCore);
-        const bool rhsRuns = continuesRun(rhs, currentCore);
+        const CoreType lhsCore = core.lookup(lhs);
+        const CoreType rhsCore = core.lookup(rhs);
+        const bool lhsRuns =
+            corePref > 0 ? continuesRun(lhs, currentCore)
+                         : (lhsCore == CoreType::UNDETERMINED ||
+                            lhsCore == currentCore);
+        const bool rhsRuns =
+            corePref > 0 ? continuesRun(rhs, currentCore)
+                         : (rhsCore == CoreType::UNDETERMINED ||
+                            rhsCore == currentCore);
         if (lhsRuns != rhsRuns) {
           return corePref > 0 ? lhsRuns : rhsRuns;
         }
@@ -1184,9 +1204,9 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
     const CoreType chosenCore = core.lookup(chosen);
     if (chosenCore != CoreType::UNDETERMINED && chosenCore != currentCore) {
       currentCore = chosenCore;
-      opsInRun = 1;
-      unlockedOtherCore = false;
-    } else if (chosenCore != CoreType::UNDETERMINED) {
+      opsInRun = countsTowardsRun(chosen) ? 1 : 0;
+    } else if (chosenCore != CoreType::UNDETERMINED &&
+               countsTowardsRun(chosen)) {
       ++opsInRun;
     }
 
@@ -1200,11 +1220,6 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
     for (Operation *succ : graph.succs.at(chosen)) {
       if (--inDeg[succ] == 0) {
         ready.push_back(succ);
-        const CoreType succCore = core.lookup(succ);
-        if (succCore != CoreType::UNDETERMINED &&
-            currentCore != CoreType::UNDETERMINED && succCore != currentCore) {
-          unlockedOtherCore = true;
-        }
       }
     }
   }

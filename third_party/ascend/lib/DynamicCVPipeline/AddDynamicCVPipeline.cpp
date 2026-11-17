@@ -441,9 +441,11 @@ VariantScore runVariantTrial(MLIRContext *context, ModuleOp moduleBackup,
   score.seed = seed;
 
   OpBuilder builder(context);
-  std::lock_guard<std::mutex> lock(trialMutex);
-  ModuleOp attempt(moduleBackup->clone());
-  
+  ModuleOp attempt;
+  {
+    std::lock_guard<std::mutex> lock(trialMutex);
+    attempt = moduleBackup->clone();
+  }
   attempt->setAttr(CVPipeline::kReorderSeed, builder.getI64IntegerAttr(seed));
   attempt->setAttr(mlir::triton::kCVPipelineCostQuiet, builder.getUnitAttr());
 
