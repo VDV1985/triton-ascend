@@ -1,0 +1,845 @@
+diff --git a/third_party/ascend/backend/compiler.py b/third_party/ascend/backend/compiler.py
+index 23fb97b12..6cc9e5c6e 100644
+--- a/third_party/ascend/backend/compiler.py
++++ b/third_party/ascend/backend/compiler.py
+@@ -323,6 +323,10 @@ def _parse_cv_pipeline_output(log_text: str, mlir_text: str) -> Dict[str, Any]:
+         "ub_bytes": 0,
+         "ub_capacity": 0,
+         "depth": 1,
++        "stages": 0,
++        "rec_producer": -1,
++        "rec_consumer": -1,
++        "partition_hash": None,
+         "has_fallback": False,
+         "err_code": 0,
+     }
+@@ -361,6 +365,22 @@ def _parse_cv_pipeline_output(log_text: str, mlir_text: str) -> Dict[str, Any]:
+         if m_depth:
+             metrics["depth"] = int(m_depth.group(1))
+ 
++        m_stages = re.search(r'triton_ascend\.cv_pipeline\.cost_pipeline_stages\s*=\s*(\d+)', mlir_text)
++        if m_stages:
++            metrics["stages"] = int(m_stages.group(1))
++
++        m_prod = re.search(r'triton_ascend\.cv_pipeline\.cost_recurrence_producer\s*=\s*(-?\d+)', mlir_text)
++        if m_prod:
++            metrics["rec_producer"] = int(m_prod.group(1))
++
++        m_cons = re.search(r'triton_ascend\.cv_pipeline\.cost_recurrence_consumer\s*=\s*(-?\d+)', mlir_text)
++        if m_cons:
++            metrics["rec_consumer"] = int(m_cons.group(1))
++
++        m_hash = re.search(r'triton_ascend\.cv_pipeline\.partition_hash\s*=\s*(-?\d+)', mlir_text)
++        if m_hash:
++            metrics["partition_hash"] = int(m_hash.group(1))
++
+     if log_text:
+         if "DynamicCVPipeline failed errCode=" in log_text:
+             m_err = re.search(r"DynamicCVPipeline failed errCode=(-?\d+)", log_text)
+@@ -397,6 +417,17 @@ def _parse_cv_pipeline_output(log_text: str, mlir_text: str) -> Dict[str, Any]:
+             if m_cap:
+                 metrics["ub_capacity"] = int(m_cap.group(1))
+ 
++        if metrics["stages"] == 0:
++            m_st = re.search(r"software pipeline:\s*(\d+)\s+stage\(s\)", log_text)
++            if m_st:
++                metrics["stages"] = int(m_st.group(1))
++
++        if metrics["rec_producer"] < 0:
++            m_tb = re.search(r"tightest buffer:\s*block\s+(\d+)\s*->\s*(\d+)", log_text)
++            if m_tb:
++                metrics["rec_producer"] = int(m_tb.group(1))
++                metrics["rec_consumer"] = int(m_tb.group(2))
++
+     return metrics
+ 
+ 
+@@ -453,6 +484,209 @@ def _run_variant_seed_trial(triton_opt: str, src_path: str, pipeline_str: str, s
+     return trial
+ 
+ 
++
++def _run_guided_recipe_trial(triton_opt: str, src_path: str, pipeline_str: str, recipe: str,
++                             trial_id: int, log_dir: str, trial_out: str, seed_timeout: int) -> Dict[str, Any]:
++    trial = {
++        "recipe": recipe,
++        "trial_id": trial_id,
++        "timed_out": False,
++        "returncode": 0,
++    }
++    log_file = os.path.join(log_dir, f"guided_{trial_id}.log")
++    cmd = [
++        triton_opt,
++        src_path,
++        f"--pass-pipeline={pipeline_str}",
++        "--mlir-print-debuginfo",
++        "-o",
++        trial_out,
++    ]
++    trial_env = os.environ.copy()
++    trial_env["TRITON_ASCEND_CV_VARIANTS"] = "1"
++    trial_env["TRITON_ASCEND_REORDER_SEED"] = "0"
++    trial_env["TRITON_ASCEND_CV_COST_VERBOSE"] = "2"
++    if recipe:
++        trial_env["TRITON_ASCEND_CV_MUTATIONS"] = recipe
++    else:
++        trial_env.pop("TRITON_ASCEND_CV_MUTATIONS", None)
++
++    with open(log_file, "w", encoding="utf-8") as lf:
++        try:
++            ret = subprocess.run(cmd, env=trial_env, stdout=lf, stderr=subprocess.STDOUT, timeout=seed_timeout)
++        except subprocess.TimeoutExpired:
++            trial["timed_out"] = True
++            lf.write(f"\n[AddDynamicCVPipeline] ERROR: Guided trial {trial_id} ({recipe}) timed out.\n")
++            lf.flush()
++    if trial["timed_out"]:
++        return trial
++
++    trial["returncode"] = ret.returncode
++    log_text = Path(log_file).read_text(encoding="utf-8", errors="replace")
++    mlir_text = Path(trial_out).read_text(encoding="utf-8", errors="replace") if os.path.exists(trial_out) else ""
++    trial.update(_parse_cv_pipeline_output(log_text, mlir_text))
++    return trial
++
++
++def _is_guided_trial_better(cand: Dict[str, Any], best: Dict[str, Any]) -> bool:
++    c_cost, b_cost = cand["cost"], best["cost"]
++    c_sec = (min(cand["resource"], cand["recurrence"])
++             if (cand["resource"] is not None and cand["recurrence"] is not None) else c_cost)
++    b_sec = (min(best["resource"], best["recurrence"])
++             if (best["resource"] is not None and best["recurrence"] is not None) else b_cost)
++    if _totals_are_tied(c_cost, b_cost):
++        if _totals_are_tied(c_sec, b_sec):
++            if cand["stages"] != best["stages"]:
++                return cand["stages"] < best["stages"]
++            return cand["ub_bytes"] < best["ub_bytes"]
++        return c_sec < b_sec
++    return c_cost < b_cost
++
++
++def _run_dynamic_cv_guided_search(src_path: str, pipeline_str: str, variant_count: int,
++                                  metadata: dict) -> str:
++    triton_opt = _get_triton_opt_path()
++    if not os.path.isfile(triton_opt) or not os.access(triton_opt, os.X_OK):
++        print(f"[AddDynamicCVPipeline] triton-opt not found at {triton_opt}; skipping guided search.")
++        return ""
++
++    log_dir = os.environ.get("TRITON_ASCEND_CV_LOG_DIR")
++    if not log_dir:
++        hash_prefix = metadata.get("hash", "cv_search")[:8]
++        log_dir = os.path.join(tempfile.gettempdir(), f"triton_cv_logs_{hash_prefix}")
++    os.makedirs(log_dir, exist_ok=True)
++
++    worker_count = max(1, _get_variant_threads())
++    ub_slack = _get_env_int("TRITON_ASCEND_CV_UB_SLACK_BYTES")
++    stage_slack_val = _get_env_int("TRITON_ASCEND_CV_STAGE_SLACK") or 0
++    seed_timeout = _get_env_int("TRITON_ASCEND_CV_SEED_TIMEOUT") or 30
++    beam_width = max(1, _get_env_int("TRITON_ASCEND_CV_BEAM_WIDTH") or 1)
++
++    print(f"[AddDynamicCVPipeline] guided search: budget={variant_count} evals, "
++          f"beam={beam_width}, threads={worker_count}")
++    sys.stdout.flush()
++
++    with tempfile.TemporaryDirectory() as trial_tmpdir:
++        evals = 0
++        base = _run_guided_recipe_trial(
++            triton_opt, src_path, pipeline_str, "", evals, log_dir,
++            os.path.join(trial_tmpdir, "out_guided_0.mlir"), seed_timeout
++        )
++        evals += 1
++        if base["timed_out"] or base["returncode"] != 0 or base["has_fallback"] or base["cost"] is None:
++            print("[AddDynamicCVPipeline] guided search: baseline failed, keeping untouched pipeline")
++            return ""
++
++        baseline_ub = base["ub_bytes"]
++        baseline_depth = base["depth"]
++        ub_allowance = ub_slack if ub_slack is not None else max(0, base["ub_capacity"] - baseline_ub)
++        best = base
++        beam: List[Dict[str, Any]] = [base]
++        visited_hashes = set()
++        visited_recipes = {""}
++        if base["partition_hash"] is not None:
++            visited_hashes.add(base["partition_hash"])
++
++        print(f"[AddDynamicCVPipeline]   baseline: {base['cost']} cycles "
++              f"(res={base['resource']}, rec={base['recurrence']}, "
++              f"UB={baseline_ub}B/{base['ub_capacity']}B, stages={base['stages']})")
++        sys.stdout.flush()
++
++        def _beam_sort_key(tr: Dict[str, Any]):
++            sec = (min(tr["resource"], tr["recurrence"])
++                   if (tr["resource"] is not None and tr["recurrence"] is not None) else tr["cost"])
++            return (tr["cost"], sec, tr["stages"], tr["ub_bytes"])
++
++        while evals < variant_count and beam:
++            neighbor_recipes: List[str] = []
++            for state in beam:
++                prefix = f"{state['recipe']}," if state["recipe"] else ""
++                cands: List[str] = []
++                # Allow splitting even in resource-bound mode to unlock multi-step
++                # combinations (e.g. split -> swap / merge).
++                if state["rec_producer"] >= 0:
++                    cands.append(f"{prefix}split:{state['rec_producer']}:{state['rec_consumer']}")
++                for r in range(2):
++                    cands.append(f"{prefix}split_heavy:{r}")
++                # Block order permutations at topological choice points (ready.size() > 1).
++                for r in range(3):
++                    cands.append(f"{prefix}swap:{r}")
++                for r in range(2):
++                    cands.append(f"{prefix}merge:{r}")
++                for r in range(2):
++                    cands.append(f"{prefix}shift:{r}")
++                for rec in cands:
++                    if rec not in visited_recipes:
++                        visited_recipes.add(rec)
++                        neighbor_recipes.append(rec)
++
++            remaining = variant_count - evals
++            neighbor_recipes = neighbor_recipes[:remaining]
++            if not neighbor_recipes:
++                break
++
++            batch_workers = min(worker_count, len(neighbor_recipes))
++            results: List[Dict[str, Any]] = []
++            if batch_workers > 1:
++                with concurrent.futures.ThreadPoolExecutor(max_workers=batch_workers) as executor:
++                    futs = [
++                        executor.submit(
++                            _run_guided_recipe_trial, triton_opt, src_path, pipeline_str,
++                            rec, evals + idx, log_dir,
++                            os.path.join(trial_tmpdir, f"out_guided_{evals + idx}.mlir"),
++                            seed_timeout
++                        )
++                        for idx, rec in enumerate(neighbor_recipes)
++                    ]
++                    for fut in concurrent.futures.as_completed(futs):
++                        results.append(fut.result())
++            else:
++                for idx, rec in enumerate(neighbor_recipes):
++                    results.append(_run_guided_recipe_trial(
++                        triton_opt, src_path, pipeline_str, rec, evals + idx, log_dir,
++                        os.path.join(trial_tmpdir, f"out_guided_{evals + idx}.mlir"),
++                        seed_timeout
++                    ))
++            evals += len(neighbor_recipes)
++
++            valid_neighbors: List[Dict[str, Any]] = []
++            for tr in sorted(results, key=lambda x: x["trial_id"]):
++                if tr["timed_out"] or tr["returncode"] != 0 or tr["has_fallback"] or tr["cost"] is None:
++                    continue
++                if tr["ub_bytes"] > baseline_ub + ub_allowance:
++                    continue
++                if tr["depth"] > baseline_depth + stage_slack_val:
++                    continue
++                if tr["partition_hash"] is not None and tr["partition_hash"] in visited_hashes:
++                    continue
++                if tr["partition_hash"] is not None:
++                    visited_hashes.add(tr["partition_hash"])
++                valid_neighbors.append(tr)
++                if _is_guided_trial_better(tr, best):
++                    best = tr
++                    print(f"[AddDynamicCVPipeline]   new best [{best['recipe']}]: "
++                          f"{best['cost']} cycles (UB={best['ub_bytes']}B, stages={best['stages']})")
++                    sys.stdout.flush()
++
++            if not valid_neighbors:
++                break
++
++            valid_neighbors.sort(key=_beam_sort_key)
++            if beam_width == 1:
++                if _is_guided_trial_better(valid_neighbors[0], beam[0]):
++                    beam = [valid_neighbors[0]]
++                else:
++                    break
++            else:
++                beam = valid_neighbors[:beam_width]
++
++        Path(os.path.join(log_dir, "best_recipe.txt")).write_text(best["recipe"], encoding="utf-8")
++        print(f"[AddDynamicCVPipeline] guided search: {evals} eval(s), "
++              f"keeping recipe='{best['recipe']}' at {best['cost']} cycles")
++        sys.stdout.flush()
++        return best["recipe"]
++
++
+ def _run_dynamic_cv_variant_search(src_path: str, pipeline_str: str, variant_count: int,
+                                    metadata: dict) -> Optional[int]:
+     triton_opt = _get_triton_opt_path()
+@@ -869,18 +1103,34 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
+         # Check if Python-level variant exploration is requested
+         variant_count = _get_env_int("TRITON_ASCEND_CV_VARIANTS") or 1
+         orig_cv_variants = os.environ.get("TRITON_ASCEND_CV_VARIANTS")
++        orig_cv_mutations = os.environ.get("TRITON_ASCEND_CV_MUTATIONS")
++        orig_reorder_seed = os.environ.get("TRITON_ASCEND_REORDER_SEED")
++        guided_search = os.environ.get("TRITON_ASCEND_CV_GUIDED_SEARCH", "0") not in ("", "0")
+ 
+         if variant_count > 1 and metadata.get("enable_dynamic_cv_pipeline"):
+-            best_seed = _run_dynamic_cv_variant_search(
+-                src_path=src_path,
+-                pipeline_str=pm.get_pipeline_str(),
+-                variant_count=variant_count,
+-                metadata=metadata,
+-            )
+-            if best_seed is not None:
+-                os.environ["TRITON_ASCEND_REORDER_SEED"] = str(best_seed)
++            if guided_search:
++                best_recipe = _run_dynamic_cv_guided_search(
++                    src_path=src_path,
++                    pipeline_str=pm.get_pipeline_str(),
++                    variant_count=variant_count,
++                    metadata=metadata,
++                )
++                os.environ["TRITON_ASCEND_REORDER_SEED"] = "0"
++                if best_recipe:
++                    os.environ["TRITON_ASCEND_CV_MUTATIONS"] = best_recipe
++                else:
++                    os.environ.pop("TRITON_ASCEND_CV_MUTATIONS", None)
+             else:
+-                os.environ.pop("TRITON_ASCEND_REORDER_SEED", None)
++                best_seed = _run_dynamic_cv_variant_search(
++                    src_path=src_path,
++                    pipeline_str=pm.get_pipeline_str(),
++                    variant_count=variant_count,
++                    metadata=metadata,
++                )
++                if best_seed is not None:
++                    os.environ["TRITON_ASCEND_REORDER_SEED"] = str(best_seed)
++                else:
++                    os.environ.pop("TRITON_ASCEND_REORDER_SEED", None)
+ 
+         if opt.debug:
+             # Print the equivalent triton-opt command line so the pass
+@@ -905,7 +1155,14 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
+                 os.environ["TRITON_ASCEND_CV_VARIANTS"] = orig_cv_variants
+             else:
+                 os.environ.pop("TRITON_ASCEND_CV_VARIANTS", None)
+-
++            if orig_cv_mutations is not None:
++                os.environ["TRITON_ASCEND_CV_MUTATIONS"] = orig_cv_mutations
++            else:
++                os.environ.pop("TRITON_ASCEND_CV_MUTATIONS", None)
++            if orig_reorder_seed is not None:
++                os.environ["TRITON_ASCEND_REORDER_SEED"] = orig_reorder_seed
++            else:
++                os.environ.pop("TRITON_ASCEND_REORDER_SEED", None)
+         _adjust_metadata_by_module_result(mod, metadata, opt, enable_mixed_cv=enable_mixed_cv,
+                                           disable_auto_inject_block_sync=disable_auto_inject_block_sync,
+                                           set_workspace_multibuffer=set_workspace_multibuffer)
+diff --git a/third_party/ascend/lib/DynamicCVPipeline/AddDynamicCVPipeline.cpp b/third_party/ascend/lib/DynamicCVPipeline/AddDynamicCVPipeline.cpp
+index 7779de105..fac4f7d69 100644
+--- a/third_party/ascend/lib/DynamicCVPipeline/AddDynamicCVPipeline.cpp
++++ b/third_party/ascend/lib/DynamicCVPipeline/AddDynamicCVPipeline.cpp
+@@ -27,7 +27,11 @@
+ #include "llvm/ADT/StringRef.h"
+ #include "llvm/Support/Debug.h"
+ 
++#include "mlir/Analysis/AliasAnalysis.h"
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/Dialect/SCF/IR/SCF.h"
++#include "mlir/IR/BuiltinTypes.h"
++#include "mlir/Pass/Pass.h"
+ #include "llvm/Support/Debug.h"
+ #include "llvm/Support/LogicalResult.h"
+ #include "llvm/Support/raw_ostream.h"
+@@ -49,11 +53,17 @@
+ #include "ascend/include/DynamicCVPipeline/AllocMultiCache.h"
+ #include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
+ #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
++#include "ascend/include/DynamicCVPipeline/Common/DependencyHelper.h"
++#include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
+ #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
++#include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Common.h"
+ #include "ascend/include/DynamicCVPipeline/EstimateCVPipelineCost.h"
+ #include "ascend/include/DynamicCVPipeline/MainLoopUnroll.h"
+ #include "ascend/include/DynamicCVPipeline/Passes.h"
++#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
++#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
+ #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Passes.h"
++#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ReorderOpsByBlockId.h"
+ #include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
+ #include "ascend/include/DynamicCVPipeline/PreCheckAvailable.h"
+ #include "ascend/include/DynamicCVPipeline/RemoveAttributes.h"
+@@ -335,6 +345,330 @@ void restoreModuleFromBackup(ModuleOp moduleOp, ModuleOp moduleBackup) {
+   moduleOp.getBodyRegion().takeBody(moduleBackup.getBodyRegion());
+ }
+ 
++
++//===----------------------------------------------------------------------===//
++// Guided mutation replay (driven by Python search via TRITON_ASCEND_CV_MUTATIONS)
++//===----------------------------------------------------------------------===//
++
++constexpr const char *kGuidedMutationsEnvVar = "TRITON_ASCEND_CV_MUTATIONS";
++constexpr int kMutationNoopErrCode = 100;
++
++int64_t getTensorValueBytes(Value val) {
++  auto ranked = dyn_cast<RankedTensorType>(val.getType());
++  if (!ranked || !ranked.hasStaticShape()) {
++    return 0;
++  }
++  int64_t elems = 1;
++  for (int64_t d : ranked.getShape()) {
++    elems *= d;
++  }
++  Type elemTy = ranked.getElementType();
++  int64_t bpe = elemTy.isIntOrFloat()
++                    ? std::max<int64_t>(1, elemTy.getIntOrFloatBitWidth() / 8)
++                    : 4;
++  return elems * bpe;
++}
++
++Block *findMainMixedLoopBlock(ModuleOp module) {
++  Block *best = nullptr;
++  module.walk([&](Operation *op) {
++    if (!isa<scf::ForOp, scf::WhileOp>(op)) {
++      return;
++    }
++    Block *body = &op->getRegion(0).front();
++    bool hasCube = false;
++    bool hasVec = false;
++    for (Operation &inner : body->without_terminator()) {
++      auto ct = CVPipeline::getCoreTypeOfSimpleOpOrCf(&inner);
++      if (ct == CVPipeline::CoreType::CUBE_ONLY) {
++        hasCube = true;
++      } else if (ct == CVPipeline::CoreType::VECTOR_ONLY) {
++        hasVec = true;
++      }
++    }
++    if (hasCube && hasVec) {
++      best = body;
++    }
++  });
++  return best;
++}
++
++bool applyGuidedSplit(ModuleOp module, int64_t prodId, int64_t consId) {
++  Block *loopBlock = findMainMixedLoopBlock(module);
++  if (!loopBlock || prodId < 0) {
++    return false;
++  }
++  AliasAnalysis aa(module);
++  CVPipeline::MemoryDependenceGraph memGraph(module, aa);
++  CVPipeline::DependencyHelper depHelper(memGraph);
++  CVPipeline::ComputeBlockIdManager bm(module);
++
++  SmallVector<Operation *> prodOps;
++  llvm::DenseSet<Operation *> prodSet;
++  for (Operation &op : loopBlock->without_terminator()) {
++    if (bm.getBlockIdByOp(&op) == prodId && !CVPipeline::isSyncOp(&op)) {
++      prodOps.push_back(&op);
++      prodSet.insert(&op);
++    }
++  }
++  if (prodOps.size() < 2) {
++    return false;
++  }
++
++  llvm::DenseSet<Operation *> keepSlice;
++  SmallVector<Operation *> worklist;
++  for (Operation *op : prodOps) {
++    bool feedsConsumer = false;
++    depHelper.forEachUser(op, [&](Operation *user) {
++      if (Operation *anc = CVPipeline::getAncestorInBlock(user, loopBlock)) {
++        if (bm.getBlockIdByOp(anc) == consId) {
++          feedsConsumer = true;
++        }
++      }
++    });
++    if (feedsConsumer && keepSlice.insert(op).second) {
++      worklist.push_back(op);
++    }
++  }
++  while (!worklist.empty()) {
++    Operation *cur = worklist.pop_back_val();
++    depHelper.forEachSource(cur, [&](Operation *src) {
++      if (Operation *anc = CVPipeline::getAncestorInBlock(src, loopBlock)) {
++        if (prodSet.contains(anc) && keepSlice.insert(anc).second) {
++          worklist.push_back(anc);
++        }
++      }
++    });
++  }
++  if (keepSlice.empty() || keepSlice.size() == prodOps.size()) {
++    keepSlice.clear();
++    for (size_t i = 0; i < prodOps.size() / 2; ++i) {
++      keepSlice.insert(prodOps[i]);
++    }
++  }
++  int newBlockId = bm.getNextId();
++  bool moved = false;
++  for (Operation *op : prodOps) {
++    if (!keepSlice.contains(op)) {
++      bm.updateBlockIdWithInner(op, newBlockId);
++      moved = true;
++    }
++  }
++  return moved;
++}
++
++bool applySplitHeaviestBlock(ModuleOp module, size_t rankIdx) {
++  Block *loopBlock = findMainMixedLoopBlock(module);
++  if (!loopBlock) {
++    return false;
++  }
++  CVPipeline::ComputeBlockIdManager bm(module);
++  llvm::DenseMap<int, SmallVector<Operation *>> opsByBlock;
++  for (Operation &op : loopBlock->without_terminator()) {
++    if (CVPipeline::isSyncOp(&op)) {
++      continue;
++    }
++    int bid = bm.getBlockIdByOp(&op);
++    if (bid >= 0) {
++      opsByBlock[bid].push_back(&op);
++    }
++  }
++  SmallVector<std::pair<size_t, int>> ranked;
++  for (const auto &[bid, ops] : opsByBlock) {
++    if (ops.size() >= 2) {
++      ranked.push_back({ops.size(), bid});
++    }
++  }
++  llvm::sort(ranked, [](const auto &a, const auto &b) {
++    if (a.first != b.first) {
++      return a.first > b.first;
++    }
++    return a.second < b.second;
++  });
++  if (rankIdx >= ranked.size()) {
++    return false;
++  }
++  return applyGuidedSplit(module, ranked[rankIdx].second, /*consId=*/-1);
++}
++
++bool applyGuidedMerge(ModuleOp module, size_t rankIdx) {
++  Block *loopBlock = findMainMixedLoopBlock(module);
++  if (!loopBlock) {
++    return false;
++  }
++  AliasAnalysis aa(module);
++  CVPipeline::MemoryDependenceGraph memGraph(module, aa);
++  CVPipeline::ComputeBlockIdManager bm(module);
++
++  llvm::DenseMap<std::pair<int, int>, int64_t> edgeBytes;
++  for (Operation &op : loopBlock->without_terminator()) {
++    if (CVPipeline::isSyncOp(&op)) {
++      continue;
++    }
++    int srcId = bm.getBlockIdByOp(&op);
++    auto srcCore = CVPipeline::getCoreTypeOfSimpleOpOrCf(&op);
++    if (srcId < 0 || (srcCore != CVPipeline::CoreType::VECTOR_ONLY &&
++                      srcCore != CVPipeline::CoreType::CUBE_ONLY)) {
++      continue;
++    }
++    for (Value res : op.getResults()) {
++      int64_t bytes = getTensorValueBytes(res);
++      for (Operation *user : res.getUsers()) {
++        Operation *anc = CVPipeline::getAncestorInBlock(user, loopBlock);
++        if (!anc || CVPipeline::isSyncOp(anc)) {
++          continue;
++        }
++        int dstId = bm.getBlockIdByOp(anc);
++        if (dstId < 0 || dstId == srcId ||
++            CVPipeline::getCoreTypeOfSimpleOpOrCf(anc) != srcCore) {
++          continue;
++        }
++        edgeBytes[{srcId, dstId}] += bytes + 1;
++      }
++    }
++  }
++  SmallVector<std::tuple<int64_t, int, int>> candidates;
++  for (const auto &[pair, bytes] : edgeBytes) {
++    candidates.push_back({bytes, pair.first, pair.second});
++  }
++  llvm::sort(candidates, [](const auto &a, const auto &b) {
++    return std::get<0>(a) > std::get<0>(b);
++  });
++  size_t validSeen = 0;
++  for (const auto &[bytes, srcId, dstId] : candidates) {
++    SmallVector<Operation *> dstOps = bm.getOpsByBlockId(dstId);
++    if (dstOps.empty() ||
++        CVPipeline::willCreateCycle(dstOps, memGraph, srcId, bm)) {
++      continue;
++    }
++    if (validSeen++ < rankIdx) {
++      continue;
++    }
++    for (Operation *op : dstOps) {
++      bm.updateBlockIdWithInner(op, srcId);
++    }
++    return true;
++  }
++  return false;
++}
++
++bool applyBoundaryShift(ModuleOp module, size_t rankIdx) {
++  Block *loopBlock = findMainMixedLoopBlock(module);
++  if (!loopBlock) {
++    return false;
++  }
++  AliasAnalysis aa(module);
++  CVPipeline::MemoryDependenceGraph memGraph(module, aa);
++  CVPipeline::ComputeBlockIdManager bm(module);
++
++  size_t validSeen = 0;
++  for (Operation &op : loopBlock->without_terminator()) {
++    if (CVPipeline::isSyncOp(&op) || CVPipeline::isScfOp(&op)) {
++      continue;
++    }
++    int srcId = bm.getBlockIdByOp(&op);
++    auto srcCore = CVPipeline::getCoreTypeOfSimpleOpOrCf(&op);
++    if (srcId < 0 || srcCore != CVPipeline::CoreType::VECTOR_ONLY) {
++      continue;
++    }
++    int targetId = -1;
++    bool hasInternalUser = false;
++    for (Operation *user : op.getUsers()) {
++      Operation *anc = CVPipeline::getAncestorInBlock(user, loopBlock);
++      if (!anc) {
++        continue;
++      }
++      int uid = bm.getBlockIdByOp(anc);
++      if (uid == srcId) {
++        hasInternalUser = true;
++        break;
++      }
++      if (uid >= 0 && CVPipeline::getCoreTypeOfSimpleOpOrCf(anc) == srcCore) {
++        targetId = uid;
++      }
++    }
++    if (hasInternalUser || targetId < 0) {
++      continue;
++    }
++    SmallVector<Operation *> singleOp = {&op};
++    if (CVPipeline::willCreateCycle(singleOp, memGraph, targetId, bm)) {
++      continue;
++    }
++    if (validSeen++ < rankIdx) {
++      continue;
++    }
++    bm.updateBlockId(&op, targetId);
++    return true;
++  }
++  return false;
++}
++
++struct ApplyGuidedMutationsPass
++    : public PassWrapper<ApplyGuidedMutationsPass, OperationPass<ModuleOp>> {
++  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ApplyGuidedMutationsPass)
++  std::string recipe;
++  explicit ApplyGuidedMutationsPass(std::string recipe)
++      : recipe(std::move(recipe)) {}
++
++  void runOnOperation() override {
++    ModuleOp module = getOperation();
++    if (CVPipeline::hasFallbackAttr(module)) {
++      return;
++    }
++    SmallVector<llvm::StringRef> steps;
++    llvm::StringRef(recipe).split(steps, ',', /*MaxSplit=*/-1,
++                                  /*KeepEmpty=*/false);
++    SmallVector<Attribute> swapAttrs;
++    OpBuilder builder(module.getContext());
++    for (llvm::StringRef step : steps) {
++      SmallVector<llvm::StringRef> parts;
++      step.trim().split(parts, ':');
++      bool ok = false;
++      if (parts.size() == 3 && parts[0] == "split") {
++        int64_t prod = -1;
++        int64_t cons = -1;
++        if (!parts[1].getAsInteger(10, prod) &&
++            !parts[2].getAsInteger(10, cons)) {
++          ok = applyGuidedSplit(module, prod, cons);
++        }
++      } else if (parts.size() == 2 && parts[0] == "split_heavy") {
++        size_t rank = 0;
++        if (!parts[1].getAsInteger(10, rank)) {
++          ok = applySplitHeaviestBlock(module, rank);
++        }
++      } else if (parts.size() == 2 && parts[0] == "merge") {
++        size_t rank = 0;
++        if (!parts[1].getAsInteger(10, rank)) {
++          ok = applyGuidedMerge(module, rank);
++        }
++      } else if (parts.size() == 2 && parts[0] == "shift") {
++        size_t rank = 0;
++        if (!parts[1].getAsInteger(10, rank)) {
++          ok = applyBoundaryShift(module, rank);
++        }
++      } else if (parts.size() == 2 && parts[0] == "swap") {
++        int64_t rank = -1;
++        if (!parts[1].getAsInteger(10, rank) && rank >= 0) {
++          swapAttrs.push_back(builder.getI64IntegerAttr(rank));
++          ok = true;
++        }
++      }
++      if (!ok) {
++        CVPipeline::setFallbackAttr(module, kMutationNoopErrCode);
++        return;
++      }
++    }
++    if (!swapAttrs.empty()) {
++      module->setAttr("triton_ascend.cv_pipeline.block_order_swaps",
++                      builder.getArrayAttr(swapAttrs));
++    }
++    // Ensure the following ReorderOpsByBlockIdPass runs in block-level mode
++    // and is not skipped by MergeComputeBlockPass's marker.
++    module->removeAttr(CVPipeline::kReorderSeed);
++    module->removeAttr(CVPipeline::kMergeComputeBlockApplied);
++  }
++};
++
+ static inline void addPasses(OpPassManager &pm, int mainLoopUnrollFactor = 0) {
+   // Unroll the main loop once the compute blocks are planned but before the
+   // dataflow is split, so that the inter core transfers, their sync flags and
+@@ -350,6 +684,12 @@ static inline void addPasses(OpPassManager &pm, int mainLoopUnrollFactor = 0) {
+   pm.addPass(createStandardizeOpPass());
+   pm.addPass(createPlanComputeBlockPass());
+   pm.addPass(createComputeBlockOptPass());
++  if (const char *mutEnv = std::getenv(kGuidedMutationsEnvVar)) {
++    if (mutEnv[0] != '\0') {
++      pm.addPass(std::make_unique<ApplyGuidedMutationsPass>(mutEnv));
++      pm.addPass(createReorderOpsByBlockIdPass());
++    }
++  }
+   pm.addPass(createSplitDataflowPass());
+   pm.addPass(createAnalyzeDataFlowPass());
+   pm.addPass(createAllocMultiCachePass());
+diff --git a/third_party/ascend/lib/DynamicCVPipeline/EstimateCVPipelineCost.cpp b/third_party/ascend/lib/DynamicCVPipeline/EstimateCVPipelineCost.cpp
+index 2e26d3ff8..3c54f91e0 100644
+--- a/third_party/ascend/lib/DynamicCVPipeline/EstimateCVPipelineCost.cpp
++++ b/third_party/ascend/lib/DynamicCVPipeline/EstimateCVPipelineCost.cpp
+@@ -3804,6 +3804,10 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
+                   builder.getI64IntegerAttr(estimate.throughputBound));
+   module->setAttr(kCVPipelineCostRecurrence,
+                   builder.getI64IntegerAttr(estimate.recurrenceBound));
++  module->setAttr("triton_ascend.cv_pipeline.cost_recurrence_producer",
++                  builder.getI64IntegerAttr(estimate.recurrence.producer));
++  module->setAttr("triton_ascend.cv_pipeline.cost_recurrence_consumer",
++                  builder.getI64IntegerAttr(estimate.recurrence.consumer));
+   module->setAttr(kCVPipelineCostUBBytes,
+                   builder.getI64IntegerAttr(estimate.ub.bytes));
+   module->setAttr(kCVPipelineCostUBPeak,
+diff --git a/third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/ReorderOpsByBlockId.cpp b/third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/ReorderOpsByBlockId.cpp
+index 1dcad7b12..8985d7667 100644
+--- a/third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/ReorderOpsByBlockId.cpp
++++ b/third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/ReorderOpsByBlockId.cpp
+@@ -381,7 +381,8 @@ struct GroupAdjacencyGraph {
+   GroupAdjacencyGraph(const BlockOpGraph &g,
+                       const DenseMap<Operation *, int> &opBlockId,
+                       ComputeBlockIdManager &bm);
+-  llvm::FailureOr<SmallVector<int>> computeTopologicalOrder();
++  llvm::FailureOr<SmallVector<int>>
++  computeTopologicalOrder(ArrayRef<int64_t> swapRanks = {});
+ };
+ 
+ void dumpGroupAdjacencyGraphToDot(const GroupAdjacencyGraph &graph, const std::string &filename) {
+@@ -486,7 +487,7 @@ GroupAdjacencyGraph::GroupAdjacencyGraph(
+  * Returns the group IDs in an order that satisfies all dependencies.
+  */
+ llvm::FailureOr<SmallVector<int>>
+-GroupAdjacencyGraph::computeTopologicalOrder() {
++GroupAdjacencyGraph::computeTopologicalOrder(ArrayRef<int64_t> swapRanks) {
+   SmallVector<int> result;
+   SmallVector<unsigned> ready; // Nodes with in-degree 0.
+   unsigned n = groupIds.size();
+@@ -526,7 +527,28 @@ GroupAdjacencyGraph::computeTopologicalOrder() {
+   ready.append(startingVectorBlocks);
+ 
+   const ReadyPolicy policy = getReadyPolicy();
++  int64_t choiceIdx = 0;
+   while (!ready.empty()) {
++    if (ready.size() > 1) {
++      int64_t swapCount = 0;
++      for (int64_t r : swapRanks) {
++        if (r == choiceIdx) {
++          ++swapCount;
++        }
++      }
++      if (swapCount > 0) {
++        const size_t shift = static_cast<size_t>(swapCount) % ready.size();
++        if (shift != 0) {
++          if (policy == ReadyPolicy::Fifo) {
++            std::swap(ready[0], ready[shift]);
++          } else {
++            const size_t last = ready.size() - 1;
++            std::swap(ready[last], ready[last - shift]);
++          }
++        }
++      }
++      ++choiceIdx;
++    }
+     auto cur = takeReady(ready, policy);
+ 
+     result.push_back(groupIds[cur]);
+@@ -1319,14 +1341,15 @@ size_t countDistinctBlockIds(ArrayRef<Operation *> order,
+ // Stable sort ops based on their group orders
+ static llvm::FailureOr<SmallVector<Operation *>> buildReorderedOps(
+     const BlockOpGraph &graph, const DenseMap<Operation *, int> &opBlockId,
+-    ComputeBlockIdManager &bm, const MemoryDependenceGraph &memGraph) {
++    ComputeBlockIdManager &bm, const MemoryDependenceGraph &memGraph,
++    ArrayRef<int64_t> swapRanks = {}) {
+   SmallVector<Operation *> reordered;
+   GroupAdjacencyGraph adjacencyGraph{graph, opBlockId, bm};
+ 
+   // computeTopologicalOrder() consumes inDeg, so keep a copy for the report.
+   const SmallVector<unsigned> inDegSnapshot = adjacencyGraph.inDeg;
+ 
+-  auto groupOrderResult = adjacencyGraph.computeTopologicalOrder();
++  auto groupOrderResult = adjacencyGraph.computeTopologicalOrder(swapRanks);
+   if (llvm::failed(groupOrderResult)) {
+     return llvm::failure();
+   }
+@@ -1369,7 +1392,8 @@ static llvm::LogicalResult
+ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
+                   ComputeBlockIdManager &bm,
+                   std::optional<uint64_t> variantSeed,
+-                  uint64_t &modulePartitionHash) {
++                  uint64_t &modulePartitionHash,
++                  ArrayRef<int64_t> swapRanks = {}) {
+   const auto allOps =
+       llvm::to_vector(llvm::make_pointer_range(block.without_terminator()));
+ 
+@@ -1433,7 +1457,8 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
+     }
+   }
+ 
+-  const auto reorderedRes = buildReorderedOps(graph, opBlockId, bm, memGraph);
++  const auto reorderedRes =
++      buildReorderedOps(graph, opBlockId, bm, memGraph, swapRanks);
+   if (failed(reorderedRes)) {
+     return failure();
+   }
+@@ -1515,6 +1540,16 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
+   auto memGraph = MemoryDependenceGraph(moduleOp, aa);
+ 
+   const std::optional<uint64_t> variantSeed = getVariantSeed(moduleOp);
++  SmallVector<int64_t> swapRanks;
++  if (auto swapsAttr = moduleOp->getAttrOfType<ArrayAttr>(
++          "triton_ascend.cv_pipeline.block_order_swaps")) {
++    for (Attribute elem : swapsAttr) {
++      if (auto intAttr = dyn_cast<IntegerAttr>(elem)) {
++        swapRanks.push_back(intAttr.getInt());
++      }
++    }
++    moduleOp->removeAttr("triton_ascend.cv_pipeline.block_order_swaps");
++  }
+   uint64_t modulePartitionHash = 0x243f6a8885a308d3ULL;
+ 
+   auto bm = ComputeBlockIdManager(moduleOp);
+@@ -1527,7 +1562,7 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
+       return WalkResult::skip();
+     }
+     if (llvm::failed(reorderOpsInBlock(*block, memGraph, bm, variantSeed,
+-                                       modulePartitionHash))) {
++                                       modulePartitionHash, swapRanks))) {
+       return WalkResult::interrupt();
+     }
+     return WalkResult::advance();
+@@ -1546,6 +1581,9 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
+                       builder.getI64IntegerAttr(
+                           static_cast<int64_t>(modulePartitionHash)));
+   }
++  moduleOp->setAttr(
++      "triton_ascend.cv_pipeline.partition_hash",
++      builder.getI64IntegerAttr(static_cast<int64_t>(modulePartitionHash)));
+ 
+   if (result.wasInterrupted()) {
+     CVPipeline::setFallbackAttr(moduleOp, CVPipeline::ERRCODE_FAILED);
