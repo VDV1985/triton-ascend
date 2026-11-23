@@ -323,6 +323,10 @@ def _parse_cv_pipeline_output(log_text: str, mlir_text: str) -> Dict[str, Any]:
         "ub_bytes": 0,
         "ub_capacity": 0,
         "depth": 1,
+        "stages": 0,
+        "rec_producer": -1,
+        "rec_consumer": -1,
+        "partition_hash": None,
         "has_fallback": False,
         "err_code": 0,
     }
@@ -361,6 +365,22 @@ def _parse_cv_pipeline_output(log_text: str, mlir_text: str) -> Dict[str, Any]:
         if m_depth:
             metrics["depth"] = int(m_depth.group(1))
 
+        m_stages = re.search(r'triton_ascend\.cv_pipeline\.cost_pipeline_stages\s*=\s*(\d+)', mlir_text)
+        if m_stages:
+            metrics["stages"] = int(m_stages.group(1))
+
+        m_prod = re.search(r'triton_ascend\.cv_pipeline\.cost_recurrence_producer\s*=\s*(-?\d+)', mlir_text)
+        if m_prod:
+            metrics["rec_producer"] = int(m_prod.group(1))
+
+        m_cons = re.search(r'triton_ascend\.cv_pipeline\.cost_recurrence_consumer\s*=\s*(-?\d+)', mlir_text)
+        if m_cons:
+            metrics["rec_consumer"] = int(m_cons.group(1))
+
+        m_hash = re.search(r'triton_ascend\.cv_pipeline\.partition_hash\s*=\s*(-?\d+)', mlir_text)
+        if m_hash:
+            metrics["partition_hash"] = int(m_hash.group(1))
+
     if log_text:
         if "DynamicCVPipeline failed errCode=" in log_text:
             m_err = re.search(r"DynamicCVPipeline failed errCode=(-?\d+)", log_text)
@@ -396,6 +416,17 @@ def _parse_cv_pipeline_output(log_text: str, mlir_text: str) -> Dict[str, Any]:
             m_cap = re.search(r"capacity of\s+(\d+)", log_text)
             if m_cap:
                 metrics["ub_capacity"] = int(m_cap.group(1))
+
+        if metrics["stages"] == 0:
+            m_st = re.search(r"software pipeline:\s*(\d+)\s+stage\(s\)", log_text)
+            if m_st:
+                metrics["stages"] = int(m_st.group(1))
+
+        if metrics["rec_producer"] < 0:
+            m_tb = re.search(r"tightest buffer:\s*block\s+(\d+)\s*->\s*(\d+)", log_text)
+            if m_tb:
+                metrics["rec_producer"] = int(m_tb.group(1))
+                metrics["rec_consumer"] = int(m_tb.group(2))
 
     return metrics
 
@@ -451,6 +482,209 @@ def _run_variant_seed_trial(triton_opt: str, src_path: str, pipeline_str: str, s
     mlir_text = Path(trial_out).read_text(encoding="utf-8", errors="replace") if os.path.exists(trial_out) else ""
     trial.update(_parse_cv_pipeline_output(log_text, mlir_text))
     return trial
+
+
+
+def _run_guided_recipe_trial(triton_opt: str, src_path: str, pipeline_str: str, recipe: str,
+                             trial_id: int, log_dir: str, trial_out: str, seed_timeout: int) -> Dict[str, Any]:
+    trial = {
+        "recipe": recipe,
+        "trial_id": trial_id,
+        "timed_out": False,
+        "returncode": 0,
+    }
+    log_file = os.path.join(log_dir, f"guided_{trial_id}.log")
+    cmd = [
+        triton_opt,
+        src_path,
+        f"--pass-pipeline={pipeline_str}",
+        "--mlir-print-debuginfo",
+        "-o",
+        trial_out,
+    ]
+    trial_env = os.environ.copy()
+    trial_env["TRITON_ASCEND_CV_VARIANTS"] = "1"
+    trial_env["TRITON_ASCEND_REORDER_SEED"] = "0"
+    trial_env["TRITON_ASCEND_CV_COST_VERBOSE"] = "2"
+    if recipe:
+        trial_env["TRITON_ASCEND_CV_MUTATIONS"] = recipe
+    else:
+        trial_env.pop("TRITON_ASCEND_CV_MUTATIONS", None)
+
+    with open(log_file, "w", encoding="utf-8") as lf:
+        try:
+            ret = subprocess.run(cmd, env=trial_env, stdout=lf, stderr=subprocess.STDOUT, timeout=seed_timeout)
+        except subprocess.TimeoutExpired:
+            trial["timed_out"] = True
+            lf.write(f"\n[AddDynamicCVPipeline] ERROR: Guided trial {trial_id} ({recipe}) timed out.\n")
+            lf.flush()
+    if trial["timed_out"]:
+        return trial
+
+    trial["returncode"] = ret.returncode
+    log_text = Path(log_file).read_text(encoding="utf-8", errors="replace")
+    mlir_text = Path(trial_out).read_text(encoding="utf-8", errors="replace") if os.path.exists(trial_out) else ""
+    trial.update(_parse_cv_pipeline_output(log_text, mlir_text))
+    return trial
+
+
+def _is_guided_trial_better(cand: Dict[str, Any], best: Dict[str, Any]) -> bool:
+    c_cost, b_cost = cand["cost"], best["cost"]
+    c_sec = (min(cand["resource"], cand["recurrence"])
+             if (cand["resource"] is not None and cand["recurrence"] is not None) else c_cost)
+    b_sec = (min(best["resource"], best["recurrence"])
+             if (best["resource"] is not None and best["recurrence"] is not None) else b_cost)
+    if _totals_are_tied(c_cost, b_cost):
+        if _totals_are_tied(c_sec, b_sec):
+            if cand["stages"] != best["stages"]:
+                return cand["stages"] < best["stages"]
+            return cand["ub_bytes"] < best["ub_bytes"]
+        return c_sec < b_sec
+    return c_cost < b_cost
+
+
+def _run_dynamic_cv_guided_search(src_path: str, pipeline_str: str, variant_count: int,
+                                  metadata: dict) -> str:
+    triton_opt = _get_triton_opt_path()
+    if not os.path.isfile(triton_opt) or not os.access(triton_opt, os.X_OK):
+        print(f"[AddDynamicCVPipeline] triton-opt not found at {triton_opt}; skipping guided search.")
+        return ""
+
+    log_dir = os.environ.get("TRITON_ASCEND_CV_LOG_DIR")
+    if not log_dir:
+        hash_prefix = metadata.get("hash", "cv_search")[:8]
+        log_dir = os.path.join(tempfile.gettempdir(), f"triton_cv_logs_{hash_prefix}")
+    os.makedirs(log_dir, exist_ok=True)
+
+    worker_count = max(1, _get_variant_threads())
+    ub_slack = _get_env_int("TRITON_ASCEND_CV_UB_SLACK_BYTES")
+    stage_slack_val = _get_env_int("TRITON_ASCEND_CV_STAGE_SLACK") or 0
+    seed_timeout = _get_env_int("TRITON_ASCEND_CV_SEED_TIMEOUT") or 30
+    beam_width = max(1, _get_env_int("TRITON_ASCEND_CV_BEAM_WIDTH") or 1)
+
+    print(f"[AddDynamicCVPipeline] guided search: budget={variant_count} evals, "
+          f"beam={beam_width}, threads={worker_count}")
+    sys.stdout.flush()
+
+    with tempfile.TemporaryDirectory() as trial_tmpdir:
+        evals = 0
+        base = _run_guided_recipe_trial(
+            triton_opt, src_path, pipeline_str, "", evals, log_dir,
+            os.path.join(trial_tmpdir, "out_guided_0.mlir"), seed_timeout
+        )
+        evals += 1
+        if base["timed_out"] or base["returncode"] != 0 or base["has_fallback"] or base["cost"] is None:
+            print("[AddDynamicCVPipeline] guided search: baseline failed, keeping untouched pipeline")
+            return ""
+
+        baseline_ub = base["ub_bytes"]
+        baseline_depth = base["depth"]
+        ub_allowance = ub_slack if ub_slack is not None else max(0, base["ub_capacity"] - baseline_ub)
+        best = base
+        beam: List[Dict[str, Any]] = [base]
+        visited_hashes = set()
+        visited_recipes = {""}
+        if base["partition_hash"] is not None:
+            visited_hashes.add(base["partition_hash"])
+
+        print(f"[AddDynamicCVPipeline]   baseline: {base['cost']} cycles "
+              f"(res={base['resource']}, rec={base['recurrence']}, "
+              f"UB={baseline_ub}B/{base['ub_capacity']}B, stages={base['stages']})")
+        sys.stdout.flush()
+
+        def _beam_sort_key(tr: Dict[str, Any]):
+            sec = (min(tr["resource"], tr["recurrence"])
+                   if (tr["resource"] is not None and tr["recurrence"] is not None) else tr["cost"])
+            return (tr["cost"], sec, tr["stages"], tr["ub_bytes"])
+
+        while evals < variant_count and beam:
+            neighbor_recipes: List[str] = []
+            for state in beam:
+                prefix = f"{state['recipe']}," if state["recipe"] else ""
+                cands: List[str] = []
+                # Allow splitting even in resource-bound mode to unlock multi-step
+                # combinations (e.g. split -> swap / merge).
+                if state["rec_producer"] >= 0:
+                    cands.append(f"{prefix}split:{state['rec_producer']}:{state['rec_consumer']}")
+                for r in range(2):
+                    cands.append(f"{prefix}split_heavy:{r}")
+                # Block order permutations at topological choice points (ready.size() > 1).
+                for r in range(3):
+                    cands.append(f"{prefix}swap:{r}")
+                for r in range(2):
+                    cands.append(f"{prefix}merge:{r}")
+                for r in range(2):
+                    cands.append(f"{prefix}shift:{r}")
+                for rec in cands:
+                    if rec not in visited_recipes:
+                        visited_recipes.add(rec)
+                        neighbor_recipes.append(rec)
+
+            remaining = variant_count - evals
+            neighbor_recipes = neighbor_recipes[:remaining]
+            if not neighbor_recipes:
+                break
+
+            batch_workers = min(worker_count, len(neighbor_recipes))
+            results: List[Dict[str, Any]] = []
+            if batch_workers > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=batch_workers) as executor:
+                    futs = [
+                        executor.submit(
+                            _run_guided_recipe_trial, triton_opt, src_path, pipeline_str,
+                            rec, evals + idx, log_dir,
+                            os.path.join(trial_tmpdir, f"out_guided_{evals + idx}.mlir"),
+                            seed_timeout
+                        )
+                        for idx, rec in enumerate(neighbor_recipes)
+                    ]
+                    for fut in concurrent.futures.as_completed(futs):
+                        results.append(fut.result())
+            else:
+                for idx, rec in enumerate(neighbor_recipes):
+                    results.append(_run_guided_recipe_trial(
+                        triton_opt, src_path, pipeline_str, rec, evals + idx, log_dir,
+                        os.path.join(trial_tmpdir, f"out_guided_{evals + idx}.mlir"),
+                        seed_timeout
+                    ))
+            evals += len(neighbor_recipes)
+
+            valid_neighbors: List[Dict[str, Any]] = []
+            for tr in sorted(results, key=lambda x: x["trial_id"]):
+                if tr["timed_out"] or tr["returncode"] != 0 or tr["has_fallback"] or tr["cost"] is None:
+                    continue
+                if tr["ub_bytes"] > baseline_ub + ub_allowance:
+                    continue
+                if tr["depth"] > baseline_depth + stage_slack_val:
+                    continue
+                if tr["partition_hash"] is not None and tr["partition_hash"] in visited_hashes:
+                    continue
+                if tr["partition_hash"] is not None:
+                    visited_hashes.add(tr["partition_hash"])
+                valid_neighbors.append(tr)
+                if _is_guided_trial_better(tr, best):
+                    best = tr
+                    print(f"[AddDynamicCVPipeline]   new best [{best['recipe']}]: "
+                          f"{best['cost']} cycles (UB={best['ub_bytes']}B, stages={best['stages']})")
+                    sys.stdout.flush()
+
+            if not valid_neighbors:
+                break
+
+            valid_neighbors.sort(key=_beam_sort_key)
+            if beam_width == 1:
+                if _is_guided_trial_better(valid_neighbors[0], beam[0]):
+                    beam = [valid_neighbors[0]]
+                else:
+                    break
+            else:
+                beam = valid_neighbors[:beam_width]
+
+        Path(os.path.join(log_dir, "best_recipe.txt")).write_text(best["recipe"], encoding="utf-8")
+        print(f"[AddDynamicCVPipeline] guided search: {evals} eval(s), "
+              f"keeping recipe='{best['recipe']}' at {best['cost']} cycles")
+        sys.stdout.flush()
+        return best["recipe"]
 
 
 def _run_dynamic_cv_variant_search(src_path: str, pipeline_str: str, variant_count: int,
@@ -869,18 +1103,34 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         # Check if Python-level variant exploration is requested
         variant_count = _get_env_int("TRITON_ASCEND_CV_VARIANTS") or 1
         orig_cv_variants = os.environ.get("TRITON_ASCEND_CV_VARIANTS")
+        orig_cv_mutations = os.environ.get("TRITON_ASCEND_CV_MUTATIONS")
+        orig_reorder_seed = os.environ.get("TRITON_ASCEND_REORDER_SEED")
+        guided_search = os.environ.get("TRITON_ASCEND_CV_GUIDED_SEARCH", "0") not in ("", "0")
 
         if variant_count > 1 and metadata.get("enable_dynamic_cv_pipeline"):
-            best_seed = _run_dynamic_cv_variant_search(
-                src_path=src_path,
-                pipeline_str=pm.get_pipeline_str(),
-                variant_count=variant_count,
-                metadata=metadata,
-            )
-            if best_seed is not None:
-                os.environ["TRITON_ASCEND_REORDER_SEED"] = str(best_seed)
+            if guided_search:
+                best_recipe = _run_dynamic_cv_guided_search(
+                    src_path=src_path,
+                    pipeline_str=pm.get_pipeline_str(),
+                    variant_count=variant_count,
+                    metadata=metadata,
+                )
+                os.environ["TRITON_ASCEND_REORDER_SEED"] = "0"
+                if best_recipe:
+                    os.environ["TRITON_ASCEND_CV_MUTATIONS"] = best_recipe
+                else:
+                    os.environ.pop("TRITON_ASCEND_CV_MUTATIONS", None)
             else:
-                os.environ.pop("TRITON_ASCEND_REORDER_SEED", None)
+                best_seed = _run_dynamic_cv_variant_search(
+                    src_path=src_path,
+                    pipeline_str=pm.get_pipeline_str(),
+                    variant_count=variant_count,
+                    metadata=metadata,
+                )
+                if best_seed is not None:
+                    os.environ["TRITON_ASCEND_REORDER_SEED"] = str(best_seed)
+                else:
+                    os.environ.pop("TRITON_ASCEND_REORDER_SEED", None)
 
         if opt.debug:
             # Print the equivalent triton-opt command line so the pass
@@ -905,7 +1155,14 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
                 os.environ["TRITON_ASCEND_CV_VARIANTS"] = orig_cv_variants
             else:
                 os.environ.pop("TRITON_ASCEND_CV_VARIANTS", None)
-
+            if orig_cv_mutations is not None:
+                os.environ["TRITON_ASCEND_CV_MUTATIONS"] = orig_cv_mutations
+            else:
+                os.environ.pop("TRITON_ASCEND_CV_MUTATIONS", None)
+            if orig_reorder_seed is not None:
+                os.environ["TRITON_ASCEND_REORDER_SEED"] = orig_reorder_seed
+            else:
+                os.environ.pop("TRITON_ASCEND_REORDER_SEED", None)
         _adjust_metadata_by_module_result(mod, metadata, opt, enable_mixed_cv=enable_mixed_cv,
                                           disable_auto_inject_block_sync=disable_auto_inject_block_sync,
                                           set_workspace_multibuffer=set_workspace_multibuffer)

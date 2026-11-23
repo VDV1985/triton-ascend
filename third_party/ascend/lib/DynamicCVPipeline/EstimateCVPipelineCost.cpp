@@ -3804,6 +3804,10 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
                   builder.getI64IntegerAttr(estimate.throughputBound));
   module->setAttr(kCVPipelineCostRecurrence,
                   builder.getI64IntegerAttr(estimate.recurrenceBound));
+  module->setAttr("triton_ascend.cv_pipeline.cost_recurrence_producer",
+                  builder.getI64IntegerAttr(estimate.recurrence.producer));
+  module->setAttr("triton_ascend.cv_pipeline.cost_recurrence_consumer",
+                  builder.getI64IntegerAttr(estimate.recurrence.consumer));
   module->setAttr(kCVPipelineCostUBBytes,
                   builder.getI64IntegerAttr(estimate.ub.bytes));
   module->setAttr(kCVPipelineCostUBPeak,

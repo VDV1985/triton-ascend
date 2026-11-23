@@ -381,7 +381,8 @@ struct GroupAdjacencyGraph {
   GroupAdjacencyGraph(const BlockOpGraph &g,
                       const DenseMap<Operation *, int> &opBlockId,
                       ComputeBlockIdManager &bm);
-  llvm::FailureOr<SmallVector<int>> computeTopologicalOrder();
+  llvm::FailureOr<SmallVector<int>>
+  computeTopologicalOrder(ArrayRef<int64_t> swapRanks = {});
 };
 
 void dumpGroupAdjacencyGraphToDot(const GroupAdjacencyGraph &graph, const std::string &filename) {
@@ -486,7 +487,7 @@ GroupAdjacencyGraph::GroupAdjacencyGraph(
  * Returns the group IDs in an order that satisfies all dependencies.
  */
 llvm::FailureOr<SmallVector<int>>
-GroupAdjacencyGraph::computeTopologicalOrder() {
+GroupAdjacencyGraph::computeTopologicalOrder(ArrayRef<int64_t> swapRanks) {
   SmallVector<int> result;
   SmallVector<unsigned> ready; // Nodes with in-degree 0.
   unsigned n = groupIds.size();
@@ -526,7 +527,28 @@ GroupAdjacencyGraph::computeTopologicalOrder() {
   ready.append(startingVectorBlocks);
 
   const ReadyPolicy policy = getReadyPolicy();
+  int64_t choiceIdx = 0;
   while (!ready.empty()) {
+    if (ready.size() > 1) {
+      int64_t swapCount = 0;
+      for (int64_t r : swapRanks) {
+        if (r == choiceIdx) {
+          ++swapCount;
+        }
+      }
+      if (swapCount > 0) {
+        const size_t shift = static_cast<size_t>(swapCount) % ready.size();
+        if (shift != 0) {
+          if (policy == ReadyPolicy::Fifo) {
+            std::swap(ready[0], ready[shift]);
+          } else {
+            const size_t last = ready.size() - 1;
+            std::swap(ready[last], ready[last - shift]);
+          }
+        }
+      }
+      ++choiceIdx;
+    }
     auto cur = takeReady(ready, policy);
 
     result.push_back(groupIds[cur]);
@@ -1319,14 +1341,15 @@ size_t countDistinctBlockIds(ArrayRef<Operation *> order,
 // Stable sort ops based on their group orders
 static llvm::FailureOr<SmallVector<Operation *>> buildReorderedOps(
     const BlockOpGraph &graph, const DenseMap<Operation *, int> &opBlockId,
-    ComputeBlockIdManager &bm, const MemoryDependenceGraph &memGraph) {
+    ComputeBlockIdManager &bm, const MemoryDependenceGraph &memGraph,
+    ArrayRef<int64_t> swapRanks = {}) {
   SmallVector<Operation *> reordered;
   GroupAdjacencyGraph adjacencyGraph{graph, opBlockId, bm};
 
   // computeTopologicalOrder() consumes inDeg, so keep a copy for the report.
   const SmallVector<unsigned> inDegSnapshot = adjacencyGraph.inDeg;
 
-  auto groupOrderResult = adjacencyGraph.computeTopologicalOrder();
+  auto groupOrderResult = adjacencyGraph.computeTopologicalOrder(swapRanks);
   if (llvm::failed(groupOrderResult)) {
     return llvm::failure();
   }
@@ -1369,7 +1392,8 @@ static llvm::LogicalResult
 reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
                   ComputeBlockIdManager &bm,
                   std::optional<uint64_t> variantSeed,
-                  uint64_t &modulePartitionHash) {
+                  uint64_t &modulePartitionHash,
+                  ArrayRef<int64_t> swapRanks = {}) {
   const auto allOps =
       llvm::to_vector(llvm::make_pointer_range(block.without_terminator()));
 
@@ -1433,7 +1457,8 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
     }
   }
 
-  const auto reorderedRes = buildReorderedOps(graph, opBlockId, bm, memGraph);
+  const auto reorderedRes =
+      buildReorderedOps(graph, opBlockId, bm, memGraph, swapRanks);
   if (failed(reorderedRes)) {
     return failure();
   }
@@ -1515,6 +1540,16 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
   auto memGraph = MemoryDependenceGraph(moduleOp, aa);
 
   const std::optional<uint64_t> variantSeed = getVariantSeed(moduleOp);
+  SmallVector<int64_t> swapRanks;
+  if (auto swapsAttr = moduleOp->getAttrOfType<ArrayAttr>(
+          "triton_ascend.cv_pipeline.block_order_swaps")) {
+    for (Attribute elem : swapsAttr) {
+      if (auto intAttr = dyn_cast<IntegerAttr>(elem)) {
+        swapRanks.push_back(intAttr.getInt());
+      }
+    }
+    moduleOp->removeAttr("triton_ascend.cv_pipeline.block_order_swaps");
+  }
   uint64_t modulePartitionHash = 0x243f6a8885a308d3ULL;
 
   auto bm = ComputeBlockIdManager(moduleOp);
@@ -1527,7 +1562,7 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
       return WalkResult::skip();
     }
     if (llvm::failed(reorderOpsInBlock(*block, memGraph, bm, variantSeed,
-                                       modulePartitionHash))) {
+                                       modulePartitionHash, swapRanks))) {
       return WalkResult::interrupt();
     }
     return WalkResult::advance();
@@ -1546,6 +1581,9 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
                       builder.getI64IntegerAttr(
                           static_cast<int64_t>(modulePartitionHash)));
   }
+  moduleOp->setAttr(
+      "triton_ascend.cv_pipeline.partition_hash",
+      builder.getI64IntegerAttr(static_cast<int64_t>(modulePartitionHash)));
 
   if (result.wasInterrupted()) {
     CVPipeline::setFallbackAttr(moduleOp, CVPipeline::ERRCODE_FAILED);

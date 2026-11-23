@@ -27,7 +27,11 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/LogicalResult.h"
 #include "llvm/Support/raw_ostream.h"
@@ -49,11 +53,17 @@
 #include "ascend/include/DynamicCVPipeline/AllocMultiCache.h"
 #include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
+#include "ascend/include/DynamicCVPipeline/Common/DependencyHelper.h"
+#include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Common.h"
 #include "ascend/include/DynamicCVPipeline/EstimateCVPipelineCost.h"
 #include "ascend/include/DynamicCVPipeline/MainLoopUnroll.h"
 #include "ascend/include/DynamicCVPipeline/Passes.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Passes.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ReorderOpsByBlockId.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
 #include "ascend/include/DynamicCVPipeline/PreCheckAvailable.h"
 #include "ascend/include/DynamicCVPipeline/RemoveAttributes.h"
@@ -335,6 +345,330 @@ void restoreModuleFromBackup(ModuleOp moduleOp, ModuleOp moduleBackup) {
   moduleOp.getBodyRegion().takeBody(moduleBackup.getBodyRegion());
 }
 
+
+//===----------------------------------------------------------------------===//
+// Guided mutation replay (driven by Python search via TRITON_ASCEND_CV_MUTATIONS)
+//===----------------------------------------------------------------------===//
+
+constexpr const char *kGuidedMutationsEnvVar = "TRITON_ASCEND_CV_MUTATIONS";
+constexpr int kMutationNoopErrCode = 100;
+
+int64_t getTensorValueBytes(Value val) {
+  auto ranked = dyn_cast<RankedTensorType>(val.getType());
+  if (!ranked || !ranked.hasStaticShape()) {
+    return 0;
+  }
+  int64_t elems = 1;
+  for (int64_t d : ranked.getShape()) {
+    elems *= d;
+  }
+  Type elemTy = ranked.getElementType();
+  int64_t bpe = elemTy.isIntOrFloat()
+                    ? std::max<int64_t>(1, elemTy.getIntOrFloatBitWidth() / 8)
+                    : 4;
+  return elems * bpe;
+}
+
+Block *findMainMixedLoopBlock(ModuleOp module) {
+  Block *best = nullptr;
+  module.walk([&](Operation *op) {
+    if (!isa<scf::ForOp, scf::WhileOp>(op)) {
+      return;
+    }
+    Block *body = &op->getRegion(0).front();
+    bool hasCube = false;
+    bool hasVec = false;
+    for (Operation &inner : body->without_terminator()) {
+      auto ct = CVPipeline::getCoreTypeOfSimpleOpOrCf(&inner);
+      if (ct == CVPipeline::CoreType::CUBE_ONLY) {
+        hasCube = true;
+      } else if (ct == CVPipeline::CoreType::VECTOR_ONLY) {
+        hasVec = true;
+      }
+    }
+    if (hasCube && hasVec) {
+      best = body;
+    }
+  });
+  return best;
+}
+
+bool applyGuidedSplit(ModuleOp module, int64_t prodId, int64_t consId) {
+  Block *loopBlock = findMainMixedLoopBlock(module);
+  if (!loopBlock || prodId < 0) {
+    return false;
+  }
+  AliasAnalysis aa(module);
+  CVPipeline::MemoryDependenceGraph memGraph(module, aa);
+  CVPipeline::DependencyHelper depHelper(memGraph);
+  CVPipeline::ComputeBlockIdManager bm(module);
+
+  SmallVector<Operation *> prodOps;
+  llvm::DenseSet<Operation *> prodSet;
+  for (Operation &op : loopBlock->without_terminator()) {
+    if (bm.getBlockIdByOp(&op) == prodId && !CVPipeline::isSyncOp(&op)) {
+      prodOps.push_back(&op);
+      prodSet.insert(&op);
+    }
+  }
+  if (prodOps.size() < 2) {
+    return false;
+  }
+
+  llvm::DenseSet<Operation *> keepSlice;
+  SmallVector<Operation *> worklist;
+  for (Operation *op : prodOps) {
+    bool feedsConsumer = false;
+    depHelper.forEachUser(op, [&](Operation *user) {
+      if (Operation *anc = CVPipeline::getAncestorInBlock(user, loopBlock)) {
+        if (bm.getBlockIdByOp(anc) == consId) {
+          feedsConsumer = true;
+        }
+      }
+    });
+    if (feedsConsumer && keepSlice.insert(op).second) {
+      worklist.push_back(op);
+    }
+  }
+  while (!worklist.empty()) {
+    Operation *cur = worklist.pop_back_val();
+    depHelper.forEachSource(cur, [&](Operation *src) {
+      if (Operation *anc = CVPipeline::getAncestorInBlock(src, loopBlock)) {
+        if (prodSet.contains(anc) && keepSlice.insert(anc).second) {
+          worklist.push_back(anc);
+        }
+      }
+    });
+  }
+  if (keepSlice.empty() || keepSlice.size() == prodOps.size()) {
+    keepSlice.clear();
+    for (size_t i = 0; i < prodOps.size() / 2; ++i) {
+      keepSlice.insert(prodOps[i]);
+    }
+  }
+  int newBlockId = bm.getNextId();
+  bool moved = false;
+  for (Operation *op : prodOps) {
+    if (!keepSlice.contains(op)) {
+      bm.updateBlockIdWithInner(op, newBlockId);
+      moved = true;
+    }
+  }
+  return moved;
+}
+
+bool applySplitHeaviestBlock(ModuleOp module, size_t rankIdx) {
+  Block *loopBlock = findMainMixedLoopBlock(module);
+  if (!loopBlock) {
+    return false;
+  }
+  CVPipeline::ComputeBlockIdManager bm(module);
+  llvm::DenseMap<int, SmallVector<Operation *>> opsByBlock;
+  for (Operation &op : loopBlock->without_terminator()) {
+    if (CVPipeline::isSyncOp(&op)) {
+      continue;
+    }
+    int bid = bm.getBlockIdByOp(&op);
+    if (bid >= 0) {
+      opsByBlock[bid].push_back(&op);
+    }
+  }
+  SmallVector<std::pair<size_t, int>> ranked;
+  for (const auto &[bid, ops] : opsByBlock) {
+    if (ops.size() >= 2) {
+      ranked.push_back({ops.size(), bid});
+    }
+  }
+  llvm::sort(ranked, [](const auto &a, const auto &b) {
+    if (a.first != b.first) {
+      return a.first > b.first;
+    }
+    return a.second < b.second;
+  });
+  if (rankIdx >= ranked.size()) {
+    return false;
+  }
+  return applyGuidedSplit(module, ranked[rankIdx].second, /*consId=*/-1);
+}
+
+bool applyGuidedMerge(ModuleOp module, size_t rankIdx) {
+  Block *loopBlock = findMainMixedLoopBlock(module);
+  if (!loopBlock) {
+    return false;
+  }
+  AliasAnalysis aa(module);
+  CVPipeline::MemoryDependenceGraph memGraph(module, aa);
+  CVPipeline::ComputeBlockIdManager bm(module);
+
+  llvm::DenseMap<std::pair<int, int>, int64_t> edgeBytes;
+  for (Operation &op : loopBlock->without_terminator()) {
+    if (CVPipeline::isSyncOp(&op)) {
+      continue;
+    }
+    int srcId = bm.getBlockIdByOp(&op);
+    auto srcCore = CVPipeline::getCoreTypeOfSimpleOpOrCf(&op);
+    if (srcId < 0 || (srcCore != CVPipeline::CoreType::VECTOR_ONLY &&
+                      srcCore != CVPipeline::CoreType::CUBE_ONLY)) {
+      continue;
+    }
+    for (Value res : op.getResults()) {
+      int64_t bytes = getTensorValueBytes(res);
+      for (Operation *user : res.getUsers()) {
+        Operation *anc = CVPipeline::getAncestorInBlock(user, loopBlock);
+        if (!anc || CVPipeline::isSyncOp(anc)) {
+          continue;
+        }
+        int dstId = bm.getBlockIdByOp(anc);
+        if (dstId < 0 || dstId == srcId ||
+            CVPipeline::getCoreTypeOfSimpleOpOrCf(anc) != srcCore) {
+          continue;
+        }
+        edgeBytes[{srcId, dstId}] += bytes + 1;
+      }
+    }
+  }
+  SmallVector<std::tuple<int64_t, int, int>> candidates;
+  for (const auto &[pair, bytes] : edgeBytes) {
+    candidates.push_back({bytes, pair.first, pair.second});
+  }
+  llvm::sort(candidates, [](const auto &a, const auto &b) {
+    return std::get<0>(a) > std::get<0>(b);
+  });
+  size_t validSeen = 0;
+  for (const auto &[bytes, srcId, dstId] : candidates) {
+    SmallVector<Operation *> dstOps = bm.getOpsByBlockId(dstId);
+    if (dstOps.empty() ||
+        CVPipeline::willCreateCycle(dstOps, memGraph, srcId, bm)) {
+      continue;
+    }
+    if (validSeen++ < rankIdx) {
+      continue;
+    }
+    for (Operation *op : dstOps) {
+      bm.updateBlockIdWithInner(op, srcId);
+    }
+    return true;
+  }
+  return false;
+}
+
+bool applyBoundaryShift(ModuleOp module, size_t rankIdx) {
+  Block *loopBlock = findMainMixedLoopBlock(module);
+  if (!loopBlock) {
+    return false;
+  }
+  AliasAnalysis aa(module);
+  CVPipeline::MemoryDependenceGraph memGraph(module, aa);
+  CVPipeline::ComputeBlockIdManager bm(module);
+
+  size_t validSeen = 0;
+  for (Operation &op : loopBlock->without_terminator()) {
+    if (CVPipeline::isSyncOp(&op) || CVPipeline::isScfOp(&op)) {
+      continue;
+    }
+    int srcId = bm.getBlockIdByOp(&op);
+    auto srcCore = CVPipeline::getCoreTypeOfSimpleOpOrCf(&op);
+    if (srcId < 0 || srcCore != CVPipeline::CoreType::VECTOR_ONLY) {
+      continue;
+    }
+    int targetId = -1;
+    bool hasInternalUser = false;
+    for (Operation *user : op.getUsers()) {
+      Operation *anc = CVPipeline::getAncestorInBlock(user, loopBlock);
+      if (!anc) {
+        continue;
+      }
+      int uid = bm.getBlockIdByOp(anc);
+      if (uid == srcId) {
+        hasInternalUser = true;
+        break;
+      }
+      if (uid >= 0 && CVPipeline::getCoreTypeOfSimpleOpOrCf(anc) == srcCore) {
+        targetId = uid;
+      }
+    }
+    if (hasInternalUser || targetId < 0) {
+      continue;
+    }
+    SmallVector<Operation *> singleOp = {&op};
+    if (CVPipeline::willCreateCycle(singleOp, memGraph, targetId, bm)) {
+      continue;
+    }
+    if (validSeen++ < rankIdx) {
+      continue;
+    }
+    bm.updateBlockId(&op, targetId);
+    return true;
+  }
+  return false;
+}
+
+struct ApplyGuidedMutationsPass
+    : public PassWrapper<ApplyGuidedMutationsPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ApplyGuidedMutationsPass)
+  std::string recipe;
+  explicit ApplyGuidedMutationsPass(std::string recipe)
+      : recipe(std::move(recipe)) {}
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    if (CVPipeline::hasFallbackAttr(module)) {
+      return;
+    }
+    SmallVector<llvm::StringRef> steps;
+    llvm::StringRef(recipe).split(steps, ',', /*MaxSplit=*/-1,
+                                  /*KeepEmpty=*/false);
+    SmallVector<Attribute> swapAttrs;
+    OpBuilder builder(module.getContext());
+    for (llvm::StringRef step : steps) {
+      SmallVector<llvm::StringRef> parts;
+      step.trim().split(parts, ':');
+      bool ok = false;
+      if (parts.size() == 3 && parts[0] == "split") {
+        int64_t prod = -1;
+        int64_t cons = -1;
+        if (!parts[1].getAsInteger(10, prod) &&
+            !parts[2].getAsInteger(10, cons)) {
+          ok = applyGuidedSplit(module, prod, cons);
+        }
+      } else if (parts.size() == 2 && parts[0] == "split_heavy") {
+        size_t rank = 0;
+        if (!parts[1].getAsInteger(10, rank)) {
+          ok = applySplitHeaviestBlock(module, rank);
+        }
+      } else if (parts.size() == 2 && parts[0] == "merge") {
+        size_t rank = 0;
+        if (!parts[1].getAsInteger(10, rank)) {
+          ok = applyGuidedMerge(module, rank);
+        }
+      } else if (parts.size() == 2 && parts[0] == "shift") {
+        size_t rank = 0;
+        if (!parts[1].getAsInteger(10, rank)) {
+          ok = applyBoundaryShift(module, rank);
+        }
+      } else if (parts.size() == 2 && parts[0] == "swap") {
+        int64_t rank = -1;
+        if (!parts[1].getAsInteger(10, rank) && rank >= 0) {
+          swapAttrs.push_back(builder.getI64IntegerAttr(rank));
+          ok = true;
+        }
+      }
+      if (!ok) {
+        CVPipeline::setFallbackAttr(module, kMutationNoopErrCode);
+        return;
+      }
+    }
+    if (!swapAttrs.empty()) {
+      module->setAttr("triton_ascend.cv_pipeline.block_order_swaps",
+                      builder.getArrayAttr(swapAttrs));
+    }
+    // Ensure the following ReorderOpsByBlockIdPass runs in block-level mode
+    // and is not skipped by MergeComputeBlockPass's marker.
+    module->removeAttr(CVPipeline::kReorderSeed);
+    module->removeAttr(CVPipeline::kMergeComputeBlockApplied);
+  }
+};
+
 static inline void addPasses(OpPassManager &pm, int mainLoopUnrollFactor = 0) {
   // Unroll the main loop once the compute blocks are planned but before the
   // dataflow is split, so that the inter core transfers, their sync flags and
@@ -350,6 +684,12 @@ static inline void addPasses(OpPassManager &pm, int mainLoopUnrollFactor = 0) {
   pm.addPass(createStandardizeOpPass());
   pm.addPass(createPlanComputeBlockPass());
   pm.addPass(createComputeBlockOptPass());
+  if (const char *mutEnv = std::getenv(kGuidedMutationsEnvVar)) {
+    if (mutEnv[0] != '\0') {
+      pm.addPass(std::make_unique<ApplyGuidedMutationsPass>(mutEnv));
+      pm.addPass(createReorderOpsByBlockIdPass());
+    }
+  }
   pm.addPass(createSplitDataflowPass());
   pm.addPass(createAnalyzeDataFlowPass());
   pm.addPass(createAllocMultiCachePass());
