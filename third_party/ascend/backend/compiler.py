@@ -687,6 +687,160 @@ def _run_dynamic_cv_guided_search(src_path: str, pipeline_str: str, variant_coun
         return best["recipe"]
 
 
+
+def _run_egraph_map_trial(triton_opt: str, src_path: str, pipeline_str: str, block_map: str,
+                          trial_id: int, log_dir: str, trial_out: str, seed_timeout: int,
+                          dump_dag_path: Optional[str] = None) -> Dict[str, Any]:
+    trial = {
+        "block_map": block_map,
+        "trial_id": trial_id,
+        "timed_out": False,
+        "returncode": 0,
+    }
+    log_file = os.path.join(log_dir, f"egraph_{trial_id}.log")
+    cmd = [
+        triton_opt,
+        src_path,
+        f"--pass-pipeline={pipeline_str}",
+        "--mlir-print-debuginfo",
+        "-o",
+        trial_out,
+    ]
+    trial_env = os.environ.copy()
+    trial_env["TRITON_ASCEND_CV_VARIANTS"] = "1"
+    trial_env["TRITON_ASCEND_REORDER_SEED"] = "0"
+    trial_env["TRITON_ASCEND_CV_COST_VERBOSE"] = "2"
+    trial_env.pop("TRITON_ASCEND_CV_MUTATIONS", None)
+    if dump_dag_path:
+        trial_env["TRITON_ASCEND_CV_DUMP_DAG"] = dump_dag_path
+    else:
+        trial_env.pop("TRITON_ASCEND_CV_DUMP_DAG", None)
+    if block_map:
+        trial_env["TRITON_ASCEND_CV_BLOCK_MAP"] = block_map
+    else:
+        trial_env.pop("TRITON_ASCEND_CV_BLOCK_MAP", None)
+
+    with open(log_file, "w", encoding="utf-8") as lf:
+        try:
+            ret = subprocess.run(cmd, env=trial_env, stdout=lf, stderr=subprocess.STDOUT, timeout=seed_timeout)
+        except subprocess.TimeoutExpired:
+            trial["timed_out"] = True
+            lf.write(f"\n[AddDynamicCVPipeline] ERROR: E-graph trial {trial_id} timed out.\n")
+            lf.flush()
+    if trial["timed_out"]:
+        return trial
+
+    trial["returncode"] = ret.returncode
+    log_text = Path(log_file).read_text(encoding="utf-8", errors="replace")
+    mlir_text = Path(trial_out).read_text(encoding="utf-8", errors="replace") if os.path.exists(trial_out) else ""
+    trial.update(_parse_cv_pipeline_output(log_text, mlir_text))
+    return trial
+
+
+def _run_dynamic_cv_egraph_search(src_path: str, pipeline_str: str, variant_count: int,
+                                  metadata: dict) -> str:
+    from .cv_egraph_partition import generate_egraph_block_maps
+
+    triton_opt = _get_triton_opt_path()
+    if not os.path.isfile(triton_opt) or not os.access(triton_opt, os.X_OK):
+        print(f"[AddDynamicCVPipeline] triton-opt not found at {triton_opt}; skipping E-graph search.")
+        return ""
+
+    log_dir = os.environ.get("TRITON_ASCEND_CV_LOG_DIR")
+    if not log_dir:
+        hash_prefix = metadata.get("hash", "cv_search")[:8]
+        log_dir = os.path.join(tempfile.gettempdir(), f"triton_cv_logs_{hash_prefix}")
+    os.makedirs(log_dir, exist_ok=True)
+
+    worker_count = max(1, _get_variant_threads())
+    ub_slack = _get_env_int("TRITON_ASCEND_CV_UB_SLACK_BYTES")
+    stage_slack_val = _get_env_int("TRITON_ASCEND_CV_STAGE_SLACK") or 0
+    seed_timeout = _get_env_int("TRITON_ASCEND_CV_SEED_TIMEOUT") or 30
+
+    print(f"[AddDynamicCVPipeline] egraph search: budget={variant_count} evals, threads={worker_count}")
+    sys.stdout.flush()
+
+    with tempfile.TemporaryDirectory() as trial_tmpdir:
+        dag_path = os.path.join(trial_tmpdir, "main_loop_dag.json")
+        base = _run_egraph_map_trial(
+            triton_opt, src_path, pipeline_str, "", 0, log_dir,
+            os.path.join(trial_tmpdir, "out_egraph_0.mlir"), seed_timeout,
+            dump_dag_path=dag_path,
+        )
+        if base["timed_out"] or base["returncode"] != 0 or base["has_fallback"] or base["cost"] is None:
+            print("[AddDynamicCVPipeline] egraph search: baseline failed, keeping untouched pipeline")
+            return ""
+        if not os.path.isfile(dag_path):
+            print("[AddDynamicCVPipeline] egraph search: main loop DAG not dumped, keeping untouched pipeline")
+            return ""
+
+        baseline_ub = base["ub_bytes"]
+        baseline_depth = base["depth"]
+        ub_allowance = ub_slack if ub_slack is not None else max(0, base["ub_capacity"] - baseline_ub)
+        visited_hashes = set()
+        if base["partition_hash"] is not None:
+            visited_hashes.add(base["partition_hash"])
+
+        print(f"[AddDynamicCVPipeline]   baseline: {base['cost']} cycles "
+              f"(res={base['resource']}, rec={base['recurrence']}, "
+              f"UB={baseline_ub}B/{base['ub_capacity']}B, stages={base['stages']})")
+        sys.stdout.flush()
+
+        block_maps = generate_egraph_block_maps(dag_path, max_candidates=max(1, variant_count - 1))
+        if not block_maps:
+            print("[AddDynamicCVPipeline] egraph search: no distinct candidates generated")
+            return ""
+
+        batch_workers = min(worker_count, len(block_maps))
+        results: List[Dict[str, Any]] = []
+        if batch_workers > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=batch_workers) as executor:
+                futs = [
+                    executor.submit(
+                        _run_egraph_map_trial, triton_opt, src_path, pipeline_str,
+                        bmap, idx + 1, log_dir,
+                        os.path.join(trial_tmpdir, f"out_egraph_{idx + 1}.mlir"),
+                        seed_timeout,
+                    )
+                    for idx, bmap in enumerate(block_maps)
+                ]
+                for fut in concurrent.futures.as_completed(futs):
+                    results.append(fut.result())
+        else:
+            for idx, bmap in enumerate(block_maps):
+                results.append(_run_egraph_map_trial(
+                    triton_opt, src_path, pipeline_str, bmap, idx + 1, log_dir,
+                    os.path.join(trial_tmpdir, f"out_egraph_{idx + 1}.mlir"),
+                    seed_timeout,
+                ))
+
+        best = base
+        usable = 0
+        for tr in sorted(results, key=lambda x: x["trial_id"]):
+            if tr["timed_out"] or tr["returncode"] != 0 or tr["has_fallback"] or tr["cost"] is None:
+                continue
+            if tr["ub_bytes"] > baseline_ub + ub_allowance:
+                continue
+            if tr["depth"] > baseline_depth + stage_slack_val:
+                continue
+            if tr["partition_hash"] is not None and tr["partition_hash"] in visited_hashes:
+                continue
+            if tr["partition_hash"] is not None:
+                visited_hashes.add(tr["partition_hash"])
+            usable += 1
+            if _is_guided_trial_better(tr, best):
+                best = tr
+                print(f"[AddDynamicCVPipeline]   new best egraph#{best['trial_id']}: "
+                      f"{best['cost']} cycles (UB={best['ub_bytes']}B, stages={best['stages']})")
+                sys.stdout.flush()
+
+        Path(os.path.join(log_dir, "best_block_map.txt")).write_text(best["block_map"], encoding="utf-8")
+        print(f"[AddDynamicCVPipeline] egraph search: {usable}/{len(block_maps)} usable, "
+              f"best={best['cost']} cycles (baseline={base['cost']})")
+        sys.stdout.flush()
+        return best["block_map"]
+
+
 def _run_dynamic_cv_variant_search(src_path: str, pipeline_str: str, variant_count: int,
                                    metadata: dict) -> Optional[int]:
     triton_opt = _get_triton_opt_path()
@@ -1104,11 +1258,28 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         variant_count = _get_env_int("TRITON_ASCEND_CV_VARIANTS") or 1
         orig_cv_variants = os.environ.get("TRITON_ASCEND_CV_VARIANTS")
         orig_cv_mutations = os.environ.get("TRITON_ASCEND_CV_MUTATIONS")
+        orig_cv_block_map = os.environ.get("TRITON_ASCEND_CV_BLOCK_MAP")
+        orig_cv_dump_dag = os.environ.get("TRITON_ASCEND_CV_DUMP_DAG")
         orig_reorder_seed = os.environ.get("TRITON_ASCEND_REORDER_SEED")
         guided_search = os.environ.get("TRITON_ASCEND_CV_GUIDED_SEARCH", "0") not in ("", "0")
+        egraph_search = os.environ.get("TRITON_ASCEND_CV_EGRAPH_SEARCH", "0") not in ("", "0")
 
         if variant_count > 1 and metadata.get("enable_dynamic_cv_pipeline"):
-            if guided_search:
+            if egraph_search:
+                best_block_map = _run_dynamic_cv_egraph_search(
+                    src_path=src_path,
+                    pipeline_str=pm.get_pipeline_str(),
+                    variant_count=variant_count,
+                    metadata=metadata,
+                )
+                os.environ["TRITON_ASCEND_REORDER_SEED"] = "0"
+                os.environ.pop("TRITON_ASCEND_CV_MUTATIONS", None)
+                os.environ.pop("TRITON_ASCEND_CV_DUMP_DAG", None)
+                if best_block_map:
+                    os.environ["TRITON_ASCEND_CV_BLOCK_MAP"] = best_block_map
+                else:
+                    os.environ.pop("TRITON_ASCEND_CV_BLOCK_MAP", None)
+            elif guided_search:
                 best_recipe = _run_dynamic_cv_guided_search(
                     src_path=src_path,
                     pipeline_str=pm.get_pipeline_str(),
@@ -1116,6 +1287,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
                     metadata=metadata,
                 )
                 os.environ["TRITON_ASCEND_REORDER_SEED"] = "0"
+                os.environ.pop("TRITON_ASCEND_CV_BLOCK_MAP", None)
                 if best_recipe:
                     os.environ["TRITON_ASCEND_CV_MUTATIONS"] = best_recipe
                 else:
@@ -1159,6 +1331,14 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
                 os.environ["TRITON_ASCEND_CV_MUTATIONS"] = orig_cv_mutations
             else:
                 os.environ.pop("TRITON_ASCEND_CV_MUTATIONS", None)
+            if orig_cv_block_map is not None:
+                os.environ["TRITON_ASCEND_CV_BLOCK_MAP"] = orig_cv_block_map
+            else:
+                os.environ.pop("TRITON_ASCEND_CV_BLOCK_MAP", None)
+            if orig_cv_dump_dag is not None:
+                os.environ["TRITON_ASCEND_CV_DUMP_DAG"] = orig_cv_dump_dag
+            else:
+                os.environ.pop("TRITON_ASCEND_CV_DUMP_DAG", None)
             if orig_reorder_seed is not None:
                 os.environ["TRITON_ASCEND_REORDER_SEED"] = orig_reorder_seed
             else:

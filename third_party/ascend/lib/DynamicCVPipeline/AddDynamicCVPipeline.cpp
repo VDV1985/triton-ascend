@@ -74,6 +74,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <tuple>
@@ -669,6 +670,195 @@ struct ApplyGuidedMutationsPass
   }
 };
 
+
+//===----------------------------------------------------------------------===//
+// E-graph DAG export & declarative block-map replay
+//===----------------------------------------------------------------------===//
+
+constexpr const char *kDumpDagEnvVar = "TRITON_ASCEND_CV_DUMP_DAG";
+constexpr const char *kBlockMapEnvVar = "TRITON_ASCEND_CV_BLOCK_MAP";
+constexpr int kBlockMapInvalidErrCode = 101;
+
+struct DumpMainLoopDagPass
+    : public PassWrapper<DumpMainLoopDagPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DumpMainLoopDagPass)
+  std::string dumpPath;
+  explicit DumpMainLoopDagPass(std::string path) : dumpPath(std::move(path)) {}
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    if (CVPipeline::hasFallbackAttr(module)) {
+      return;
+    }
+    Block *loopBlock = findMainMixedLoopBlock(module);
+    if (!loopBlock) {
+      return;
+    }
+
+    SmallVector<Operation *> ops;
+    llvm::DenseMap<Operation *, size_t> opIdx;
+    for (Operation &op : loopBlock->without_terminator()) {
+      opIdx[&op] = ops.size();
+      ops.push_back(&op);
+    }
+
+    AliasAnalysis aa(module);
+    CVPipeline::MemoryDependenceGraph memGraph(module, aa);
+    CVPipeline::DependencyHelper depHelper(memGraph);
+    CVPipeline::ComputeBlockIdManager bm(module);
+
+    auto resolveIdx = [&](Operation *op) -> std::optional<size_t> {
+      if (!op) {
+        return std::nullopt;
+      }
+      if (auto it = opIdx.find(op); it != opIdx.end()) {
+        return it->second;
+      }
+      if (Operation *anc = CVPipeline::getAncestorInBlock(op, loopBlock)) {
+        if (auto it = opIdx.find(anc); it != opIdx.end()) {
+          return it->second;
+        }
+      }
+      return std::nullopt;
+    };
+
+    llvm::DenseSet<std::pair<size_t, size_t>> edgeSet;
+    SmallVector<std::pair<size_t, size_t>> edges;
+    auto addEdge = [&](size_t u, size_t v) {
+      if (u != v && edgeSet.insert({u, v}).second) {
+        edges.push_back({u, v});
+      }
+    };
+
+    for (size_t i = 0; i < ops.size(); ++i) {
+      Operation *op = ops[i];
+      depHelper.forEachSource(op, [&](Operation *src) {
+        if (auto srcIdx = resolveIdx(src)) {
+          addEdge(*srcIdx, i);
+        }
+      });
+      depHelper.forEachUser(op, [&](Operation *user) {
+        if (auto dstIdx = resolveIdx(user)) {
+          addEdge(i, *dstIdx);
+        }
+      });
+      // Preserve barrier fence ordering so E-graph never swaps across sync ops.
+      if (CVPipeline::isSyncOp(op)) {
+        for (size_t j = 0; j < i; ++j) {
+          addEdge(j, i);
+        }
+        for (size_t j = i + 1; j < ops.size(); ++j) {
+          addEdge(i, j);
+        }
+      }
+    }
+
+    std::ofstream os(dumpPath, std::ios::out | std::ios::trunc);
+    if (!os.is_open()) {
+      return;
+    }
+
+    os << "{\n  \"ops\": [\n";
+    for (size_t i = 0; i < ops.size(); ++i) {
+      Operation *op = ops[i];
+      int coreCode = -1;
+      if (!CVPipeline::isSyncOp(op)) {
+        auto ct = CVPipeline::getCoreTypeOfSimpleOpOrCf(op);
+        if (ct == CVPipeline::CoreType::CUBE_ONLY) {
+          coreCode = 1;
+        } else if (ct == CVPipeline::CoreType::VECTOR_ONLY) {
+          coreCode = 2;
+        }
+      }
+      int bid = bm.getBlockIdByOp(op);
+      int64_t bytes = 0;
+      for (Value res : op->getResults()) {
+        bytes += getTensorValueBytes(res);
+      }
+      std::string opName = op->getName().getStringRef().str();
+      os << "    {\"idx\": " << i << ", \"core\": " << coreCode
+         << ", \"block_id\": " << bid << ", \"bytes\": " << bytes
+         << ", \"name\": \"" << opName << "\"}";
+      if (i + 1 < ops.size()) {
+        os << ",";
+      }
+      os << "\n";
+    }
+    os << "  ],\n  \"edges\": [";
+    for (size_t i = 0; i < edges.size(); ++i) {
+      if (i > 0) {
+        os << ", ";
+      }
+      os << "[" << edges[i].first << ", " << edges[i].second << "]";
+    }
+    os << "]\n}\n";
+  }
+};
+
+struct ApplyBlockMapPass
+    : public PassWrapper<ApplyBlockMapPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ApplyBlockMapPass)
+  std::string blockMapSpec;
+  explicit ApplyBlockMapPass(std::string spec)
+      : blockMapSpec(std::move(spec)) {}
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    if (CVPipeline::hasFallbackAttr(module)) {
+      return;
+    }
+    Block *loopBlock = findMainMixedLoopBlock(module);
+    if (!loopBlock) {
+      CVPipeline::setFallbackAttr(module, kBlockMapInvalidErrCode);
+      return;
+    }
+
+    SmallVector<Operation *> ops;
+    for (Operation &op : loopBlock->without_terminator()) {
+      ops.push_back(&op);
+    }
+
+    CVPipeline::ComputeBlockIdManager bm(module);
+    // Remap logical IDs from the E-graph to fresh global block IDs so they
+    // never collide with blocks outside the main mixed loop.
+    llvm::DenseMap<int, int> remappedIds;
+    SmallVector<llvm::StringRef> entries;
+    llvm::StringRef(blockMapSpec)
+        .split(entries, ',', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+
+    bool appliedAny = false;
+    for (llvm::StringRef entry : entries) {
+      auto [idxStr, bidStr] = entry.trim().split(':');
+      size_t idx = 0;
+      int rawBid = -1;
+      if (idxStr.trim().getAsInteger(10, idx) ||
+          bidStr.trim().getAsInteger(10, rawBid) || idx >= ops.size() ||
+          rawBid < 0) {
+        CVPipeline::setFallbackAttr(module, kBlockMapInvalidErrCode);
+        return;
+      }
+      if (CVPipeline::isSyncOp(ops[idx])) {
+        continue;
+      }
+      auto [it, inserted] = remappedIds.try_emplace(rawBid, -1);
+      if (inserted) {
+        it->second = bm.getNextId();
+      }
+      bm.updateBlockIdWithInner(ops[idx], it->second);
+      appliedAny = true;
+    }
+
+    if (!appliedAny) {
+      CVPipeline::setFallbackAttr(module, kBlockMapInvalidErrCode);
+      return;
+    }
+    // Ensure the following ReorderOpsByBlockIdPass runs in block-level mode
+    // and is not skipped by MergeComputeBlockPass's marker.
+    module->removeAttr(CVPipeline::kReorderSeed);
+    module->removeAttr(CVPipeline::kMergeComputeBlockApplied);
+  }
+};
+
 static inline void addPasses(OpPassManager &pm, int mainLoopUnrollFactor = 0) {
   // Unroll the main loop once the compute blocks are planned but before the
   // dataflow is split, so that the inter core transfers, their sync flags and
@@ -684,6 +874,17 @@ static inline void addPasses(OpPassManager &pm, int mainLoopUnrollFactor = 0) {
   pm.addPass(createStandardizeOpPass());
   pm.addPass(createPlanComputeBlockPass());
   pm.addPass(createComputeBlockOptPass());
+  if (const char *dumpEnv = std::getenv(kDumpDagEnvVar)) {
+    if (dumpEnv[0] != '\0') {
+      pm.addPass(std::make_unique<DumpMainLoopDagPass>(dumpEnv));
+    }
+  }
+  if (const char *mapEnv = std::getenv(kBlockMapEnvVar)) {
+    if (mapEnv[0] != '\0') {
+      pm.addPass(std::make_unique<ApplyBlockMapPass>(mapEnv));
+      pm.addPass(createReorderOpsByBlockIdPass());
+    }
+  }
   if (const char *mutEnv = std::getenv(kGuidedMutationsEnvVar)) {
     if (mutEnv[0] != '\0') {
       pm.addPass(std::make_unique<ApplyGuidedMutationsPass>(mutEnv));
